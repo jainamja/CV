@@ -23,19 +23,19 @@ flowchart TD
         P2 -- "Not Found" --> P4["Original Projection"]
         P3 --> P5["Grayscale Conversion"]
         P4 --> P5
-        P5 --> P6["Gaussian Smoothing (5x5, sigma=0)"]
-        P6 --> P7["Inverted Adaptive Threshold (Gaussian C=4, Block=15)"]
+        P5 --> P6["Light Smoothing (3x3, sigma=0)"]
+        P6 --> P7["Inverted Binarization (Default Otsu, Adaptive Fallback)"]
         P7 --> P8["Morphological Opening (2x2 Ellipse)"]
-        P8 --> P9["Morphological Closing (3x3 Rect)"]
+        P8 --> P9["Morphological Closing (2x2 Rect)"]
         P9 --> P10["minAreaRect Orientation Deskewing"]
     end
 
     subgraph Segmentation ["3. Character Segmentation"]
         P10 --> S1["External Contour Detection (cv2.RETR_EXTERNAL)"]
-        S1 --> S2["Noise Filter (Min Area & Height)"]
+        S1 --> S2["Physical Noise Filter (Span & Non-Zero Pixels)"]
         S2 --> S3["Multi-Stroke Merging (=, ÷, multi-strokes)"]
         S3 --> S4["Left-to-Right Reading Order Sorting"]
-        S4 --> S5["Square Padding with 18% Margin"]
+        S4 --> S5["Square Padding with 4% Margin"]
         S5 --> S6["45x45 Normalization [0.0, 1.0]"]
     end
 
@@ -82,7 +82,7 @@ flowchart TD
 * **Classical Machine Learning Baseline:** Scikit-Learn (HOG + RBF Support Vector Machine)
 * **Symbolic Mathematics:** SymPy 1.14+
 * **User Interface:** Streamlit 1.40+, `streamlit-drawable-canvas` (Modern Ed-Tech Light Theme)
-* **Test Suite:** Pytest 9.1+ (36 passing automated unit tests)
+* **Test Suite:** Pytest 9.1+ (39 passing automated unit tests)
 
 > [!IMPORTANT]
 > **Zero Pre-Built OCR Compliance:** This project **does not** use Tesseract, EasyOCR, PaddleOCR, Google Cloud Vision, or any pre-packaged OCR library. All character detection, stroke clustering, contour segmentation, and character classification are implemented from first principles using classical OpenCV and custom neural architectures.
@@ -94,25 +94,25 @@ flowchart TD
 Every image conditioning step was chosen based on fundamental signal processing principles:
 
 ### A. Scale Normalization (`resize_preserve_aspect`)
-* **Why:** Camera photos range from 720p webcams to 48MP smartphone sensors. Morphological kernels (e.g. $3\times 3$) and contour area thresholds have fixed pixel dimensions. Downscaling high-resolution photos to a uniform maximum width (1000px) ensures uniform morphological filter behavior.
+* **Why:** Camera photos range from 720p webcams to 48MP smartphone sensors. Morphological kernels (e.g. $2\times 2$) and contour area thresholds have fixed pixel dimensions. Downscaling high-resolution photos to a uniform maximum width (1000px) ensures uniform morphological filter behavior.
 * **Aspect Ratio:** $\text{new\_height} = \text{new\_width} \times \left(\frac{\text{height}}{\text{width}}\right)$ prevents horizontal/vertical stretching.
 
 ### B. Quadrilateral Perspective Warp (`correct_perspective`)
 * **Why:** Angled photos distort character topology (keystone effect), slanting vertical strokes and compressing horizontal bars.
 * **Method:** Otsu-guided Canny edge detection isolates document borders. `cv2.findContours` finds candidate quadrilaterals. `cv2.approxPolyDP` with epsilon $0.02 \times \text{perimeter}$ finds 4-point convex polygons. `cv2.getPerspectiveTransform` and `cv2.warpPerspective` project the paper flat.
 
-### C. Gaussian Blur (`apply_gaussian_blur`)
-* **Why:** High-frequency thermal and sensor noise corrupts binary thresholding. Convolving with a 2D Gaussian kernel ($5\times 5$, $\sigma=0$) acts as an isotropic low-pass filter, attenuating pixel-level variance before thresholding.
+### C. Smoothing (`apply_gaussian_blur`)
+* **Why:** High-frequency sensor noise corrupts binary thresholding. Convolving with a light 2D Gaussian kernel ($3\times 3$, $\sigma=0$) acts as an isotropic low-pass filter, attenuating pixel-level noise without blurring stroke boundaries.
 
-### D. Inverted Gaussian Adaptive Thresholding (`apply_adaptive_threshold`)
-* **Why not Global or Otsu?** Handwritten photos suffer from shadows, vignetting, and ambient lighting gradients. Global thresholding ($T=127$) and Otsu's thresholding assume a global bimodal intensity distribution; shadowed page corners turn entirely black.
-* **Adaptive Gaussian:** Computes dynamic thresholds per local $15\times 15$ pixel neighborhood:
+### D. Inverted Otsu & Adaptive Binarization (`apply_adaptive_threshold`)
+* **Why Otsu by Default:** Heavy blurring and unconstrained adaptive thresholding cause stroke blooming (thickening strokes by >300%), which corrupts CNN features. MathVision utilizes clean, unblurred Otsu binarization (`cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU`) by default to preserve precise stroke widths matching the training distribution.
+* **Adaptive Gaussian Fallback:** For photos with non-uniform shadow gradients, an optional Adaptive Gaussian thresholding mode computes local thresholds across $15\times 15$ pixel blocks:
   $$T(x, y) = \mu_{\text{Gaussian}}(x, y) - C$$
-* **Inversion (`THRESH_BINARY_INV`):** Ensures ink is white foreground ($255$) and paper is black background ($0$), which is required for OpenCV contour extraction and CNN receptive fields.
+* **Inversion (`THRESH_BINARY_INV`):** Ensures ink is white foreground ($255$) and paper is black background ($0$), required for OpenCV contour extraction and CNN receptive fields.
 
 ### E. Morphological Opening & Closing (`apply_morphology`)
 * **Opening ($A \circ B = (A \ominus B) \oplus B$):** Erosion followed by dilation with a $2\times 2$ elliptical structuring element eliminates isolated single-pixel salt noise and pen splatter without thinning main strokes.
-* **Closing ($A \bullet B = (A \oplus B) \ominus B$):** Dilation followed by erosion with a $3\times 3$ rectangular kernel bridges hairline fractures in strokes caused by dry pens or rapid pen lifts.
+* **Closing ($A \bullet B = (A \oplus B) \ominus B$):** Dilation followed by erosion with a $2\times 2$ rectangular kernel bridges hairline fractures in strokes caused by dry pens or rapid pen lifts.
 
 ### F. Text Baseline Deskewing (`deskew_image`)
 * **Why:** Sloped handwriting on unlined paper impairs left-to-right sorting and spatial exponent detection.
@@ -120,19 +120,20 @@ Every image conditioning step was chosen based on fundamental signal processing 
 
 ### G. External Contour Localization (`find_symbol_contours`)
 * **Why `RETR_EXTERNAL`?** Retrieves only outermost parent contours, discarding internal loops (e.g. inside `0`, `8`, `6`, `4`). `RETR_TREE` would produce redundant nested sub-boxes for every closed loop.
+* **Shoelace Failure & Physical Span Filter:** Standard polygon shoelace area (`cv2.contourArea`) yields $0.0$ on 1-pixel thin strokes (`1`, `7`, `-`, `=`). We enforce physical bounding box dimensions $\max(w, h) \ge 6, \min(w, h) \ge 1$ and verify non-zero ink density $\text{countNonZero} \ge 8$.
 
 ### H. Multi-Stroke Bounding Box Merging (`merge_bounding_boxes`)
-* **The Problem:** Characters like `=`, `÷`, `i`, `j`, and multi-stroke `+` consist of disconnected strokes that produce separate contours.
+* **The Problem:** Characters like `=`, `÷`, and multi-stroke `+` consist of disconnected strokes that produce separate contours.
 * **The Solution:** A geometric clustering algorithm tests pairs of candidate bounding boxes $(x_1, y_1, w_1, h_1)$ and $(x_2, y_2, w_2, h_2)$:
   1. **Horizontal Overlap Ratio:**
-     $$\frac{\text{overlap}_x}{\min(w_1, w_2)} \ge 0.35$$
-  2. **Vertical Gap Allowance:**
-     $$\text{gap}_y \le \max\left(2.5 \cdot \max(h_1, h_2), 0.8 \cdot \min(w_1, w_2), 30\text{px}\right)$$
+     $$\frac{\text{overlap}_x}{\min(w_1, w_2)} \ge 0.40$$
+  2. **Vertical Proximity Window:**
+     $$\text{gap}_y \le 1.25 \cdot \max(h_1, h_2)$$
   Transitive clustering merges all overlapping strokes into one unified bounding box.
 
 ### I. Aspect-Ratio Safe Square Padding & Centering (`normalize_symbol_crop`)
 * **Why:** Directly resizing a tall, narrow digit `1` or a flat, wide minus `-` to $45\times 45$ severely distorts stroke aspect ratios.
-* **Method:** Identifies the maximum dimension $M = \max(w, h)$, computes symmetric centering offsets, adds an $18\%$ border margin, and places the glyph on a black canvas before downsampling to $45\times 45$ in $[0.0, 1.0]$.
+* **Method:** Identifies the maximum dimension $M = \max(w, h)$, computes symmetric centering offsets, adds an intentional $4\%$ border margin (aligning glyph height with the $41.2$px / 91.5% Kaggle dataset distribution), and places the glyph on a black canvas before downsampling to $45\times 45$ in $[0.0, 1.0]$.
 
 ---
 
@@ -293,6 +294,24 @@ Ten visual failure cases have been saved to `outputs/failure_cases/` for inspect
    - Computes discriminant $\Delta = b^2 - 4ac$ and interprets nature of roots ($\Delta > 0$, $\Delta = 0$, $\Delta < 0$).
    - Substitutes into the quadratic formula $x = \frac{-b \pm \sqrt{\Delta}}{2a}$ and computes roots.
 
+### Minimum Solver Test Suite (Phase 5 End-to-End Image Verification)
+
+All 6 canonical benchmark equations synthesized from real held-out test crops were verified end-to-end through the full pipeline:
+
+| # | Input Expression | Parsed Equation | SymPy Solution | Recognition | Solver | Latency |
+|---|---|---|---|:---:|:---:|---:|
+| 1 | $12 + 8 \div 4 = 14$ | `12+8/4=14` | True Identity (Infinite solutions) | **PASS** | **PASS** | 718.0 ms |
+| 2 | $7 \times 8 - 9 = 47$ | `7*8-9=47` | True Identity (Infinite solutions) | **PASS** | **PASS** | 613.7 ms |
+| 3 | $2x + 5 = 15$ | `2*x+5=15` | $x = 5$ | **PASS** | **PASS** | 587.8 ms |
+| 4 | $4x - 7 = 2x + 9$ | `4*x-7=2*x+9` | $x = 8$ | **PASS** | **PASS** | 238.7 ms |
+| 5 | $x^2 - 5x + 6 = 0$ | `x**2-5*x+6=0` | $x = 2, x = 3$ | **PASS** | **PASS** | 221.7 ms |
+| 6 | $3(x - 4) = 18$ | `3*(x-4)=18` | $x = 10$ | **PASS** | **PASS** | 216.0 ms |
+
+* **Recognition Accuracy:** **6 / 6 (100.0%)**
+* **Solver Accuracy:** **6 / 6 (100.0%)**
+* **Standalone Mathematical Solver Suite:** **8 / 8 (100.0%)**
+* **Unit & Integration Regression Suite (`pytest`):** **39 / 39 (100.0%)**
+
 ---
 
 ## 6. Project Directory Structure
@@ -308,16 +327,18 @@ CV Project/
 │   └── samples_real/                # Real camera photo evaluation benchmark
 ├── docs/
 │   ├── MODEL_CARD.md                # Comprehensive Model Card (provenance, metrics, limits)
-│   └── VIVA_PREPARATION_GUIDE.md    # 14 Detailed Viva Defense Q&A with math proofs
+│   ├── VIVA_PREPARATION_GUIDE.md    # 20 Detailed Viva Defense Q&A with math proofs
+│   └── DEMO_WALKTHROUGH.md          # 8-Minute Step-by-Step Live Presentation Guide
 ├── models/
 │   ├── cnn_mathvision.keras         # Checkpointed best Deep CNN model (895k params)
 │   ├── svm_baseline.joblib          # Trained HOG+SVM baseline classifier
 │   └── test_split.npz               # Held-out test split for reproducibility
 ├── outputs/
+│   ├── test_report.md               # End-to-end verification and benchmark report
+│   ├── results.md                   # Automated experimental benchmark report
 │   ├── confusion_matrix_cnn.png     # CNN normalized confusion matrix
 │   ├── confusion_matrix_svm.png     # Baseline SVM normalized confusion matrix
 │   ├── training_curves.png          # Training loss & accuracy curves
-│   ├── results.md                   # Automated experimental benchmark report
 │   ├── composed_benchmark_predictions.json # Per-equation benchmark predictions
 │   ├── failure_cases/               # Misclassified symbol crops
 │   └── stage1_intermediates/        # Intermediate CV images
@@ -365,7 +386,7 @@ pip install -r requirements.txt
 ```bash
 python -m pytest tests/ -v
 ```
-*(All 33 tests will pass in ~15 seconds)*
+*(All 39 tests will pass in ~22 seconds)*
 
 ### 3. (Optional) Re-train Models or Run Evaluation
 ```bash

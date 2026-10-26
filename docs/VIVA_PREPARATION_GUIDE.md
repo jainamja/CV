@@ -210,3 +210,74 @@ On our 220 held-out composed equations (1,463 total crops):
 3. **Unassisted Exact Accuracy ($170 / 220 = 77.27\%$):** Actual pipeline accuracy without human intervention ($150$ unflagged correct $+ 20$ equations correct despite receiving an amber warning).
 4. **Oracle-Simulated Assisted Accuracy ($173 / 220 = 78.64\%$):** Simulates an oracle correcting the 34 flagged tokens ($170 + 3 = 173$). We explicitly state that **actual human-assisted accuracy has not been measured in a user study**.
 5. **Upper Bound Limitation:** Composed from pre-segmented clean crops placed side-by-side with known bounding boxes; it excludes real-world document segmentation challenges (ink bleed, touching strokes, shadow gradients) and represents a segmentation-free optimistic upper bound.
+
+---
+
+## 7. Classical Segmentation Debugging & Real-World Failure Analysis
+
+### Q15: Why did Green's Shoelace formula (`cv2.contourArea`) fail on thin handwritten strokes, and how did you fix it?
+**Answer:**
+`cv2.contourArea` computes the enclosed polygon area using Green's theorem:
+$$A = \frac{1}{2} \left| \sum_{i=0}^{n-1} (x_i y_{i+1} - x_{i+1} y_i) \right|$$
+For a closed geometric loop (like `0`, `6`, `8`, or `9`), $A$ accurately measures the internal area. However, for open 1-pixel or 2-pixel thin strokes—such as minus signs (`-`), plus signs (`+`), equality bars (`=`), or straight digits (`1`, `7`)—the contour boundary folds back on itself with zero interior width. Its mathematical polygon area evaluates to $0.0$ to $3.5$.
+
+A filter like `cv2.contourArea(cnt) < 25` caused $100\%$ detection failure on all thin strokes.
+**The Fix:**
+We discarded the shoelace polygon area for stroke filtering and replaced it with two physically grounded criteria:
+1. **Bounding Box Span:** $\max(w, h) \ge 6 \text{ px}$ and $\min(w, h) \ge 1 \text{ px}$ to eliminate microscopic sub-pixel dust.
+2. **Foreground Ink Mass:** $\text{cv2.countNonZero}(\text{crop}) \ge 8 \text{ pixels}$, verifying that real ink exists regardless of stroke topology.
+
+---
+
+### Q16: Why did adaptive thresholding bloom strokes, and why is Otsu the preferred default?
+**Answer:**
+Adaptive Gaussian thresholding computes local thresholds based on neighborhood mean intensity. In white paper regions with uniform background, the local variance is minuscule ($\sigma^2 \approx 0$). Consequently, subtle paper fibers or anti-aliasing pen halos exceed the local threshold ($I < \mu - C$), causing strokes to artificially expand ("bloom") by over 300%.
+- In our diagnostics, bloomed strokes had mean pixel density of $35.4$, whereas the CNN training dataset had mean density of $11.9 \pm 3.2$.
+- This 3x thickening activated diagonal edge filters in the CNN, misclassifying digits `2` and `7` as `x`.
+- **The Fix:** We established unblurred Otsu's thresholding (`cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU`) as the default binarizer. Otsu calculates a global inter-class variance threshold that respects natural stroke boundaries. Adaptive Gaussian thresholding is preserved as an optional toggle for heavily shadowed smartphone photos.
+
+---
+
+### Q17: What is the impact of crop padding margin ratio on CNN classification?
+**Answer:**
+When segmenting a character bounding box and placing it into a $45 \times 45$ canvas, the padding margin ratio determines the relative scale of the character:
+$$\text{padded\_size} = S \times (1 + 2 \times \text{margin\_ratio})$$
+- With `padding_margin_ratio: 0.18` (18%), the glyph was compressed into a small ~32px sub-region inside the $45 \times 45$ patch.
+- However, the Kaggle training dataset was cropped tightly around characters with an average glyph height of $41.2$ px ($91.5\%$ of the canvas).
+- This spatial frequency mismatch caused the CNN's learned convolutional filters to miss crucial topological features.
+- **The Fix:** Setting `padding_margin_ratio: 0.04` (4%) restored the extracted glyphs to $41.4$ px, perfectly aligning with the training distribution and restoring CNN accuracy to $>94\%$.
+
+---
+
+### Q18: How does MathVision prevent SymPy solver freezes on complex or invalid equations?
+**Answer:**
+SymPy's `solve()` uses general Groebner basis algorithms and heuristic transcendental solvers. If an invalid or unconstrained equation is passed (such as $3^x \cdot 4$), SymPy enters a computationally intensive branch that can hang the application thread indefinitely.
+**Safety Measures Implemented:**
+1. **Restricted Exponent Parsing:** Superscript detection is restricted strictly to numeric digits `0`–`9` and polynomial bases ($x^2, x^3$). Arbitrary expressions are not parsed as powers without explicit syntax.
+2. **Baseline Elevation Guard:** Exponents must satisfy strict baseline elevation ($\text{bottom} \le y_{\text{base}} + 0.78 \cdot h_{\text{base}}$).
+3. **Execution Timeout Guard (`safe_solve`):** The solver wraps SymPy calls in a 3.0-second background execution thread or signal timer. If computation exceeds 3.0 seconds, it gracefully terminates and returns an informative `timeout` status card rather than crashing the UI.
+
+---
+
+### Q19: Why not use external datasets like Google MathWriting, HME100K, or CROHME?
+**Answer:**
+1. **Google MathWriting Dataset:** Contains online digital ink (InkML format with temporal stroke sequences $(x_i, y_i, t_i)$). Converting online trajectories to offline 2D raster images requires complex rasterization with artificial stroke broadening and anti-aliasing simulation.
+2. **HME100K Dataset:** Comprises complete multi-line document images paired directly with LaTeX strings. It is intended for end-to-end Sequence-to-Sequence (Seq2Seq) Encoder-Decoder models (like TrOCR or Vision Transformers). It lacks character-level bounding box annotations required for classical segmentation pipelines.
+3. **CROHME:** Focuses on InkML MathML syntax trees for online recognition competitions.
+4. **Conclusion:** Our modular architecture uses classical OpenCV segmentation paired with a character-level CNN. The Kaggle isolated symbol dataset matches this exact paradigm, providing 18,996 clean, deduplicated raster crops across all 18 classes with verified 94.18% test accuracy.
+
+---
+
+### Q20: What are the verified end-to-end benchmark results on the Minimum Solver Test Suite?
+**Answer:**
+On the 6 canonical benchmark equations passed through end-to-end image synthesis, OpenCV segmentation, CNN classification, Bayesian disambiguation, and SymPy solving:
+1. $12 + 8 \div 4 = 14 \implies$ True Identity (718.0 ms) — **PASS**
+2. $7 \times 8 - 9 = 47 \implies$ True Identity (613.7 ms) — **PASS**
+3. $2x + 5 = 15 \implies x = 5$ (587.8 ms) — **PASS**
+4. $4x - 7 = 2x + 9 \implies x = 8$ (238.7 ms) — **PASS**
+5. $x^2 - 5x + 6 = 0 \implies x = 2, x = 3$ (221.7 ms) — **PASS**
+6. $3(x - 4) = 18 \implies x = 10$ (216.0 ms) — **PASS**
+
+- **End-to-End Recognition Accuracy:** **6 / 6 (100.0%)**
+- **End-to-End Solver Accuracy:** **6 / 6 (100.0%)**
+- **Automated Regression Suite:** **39 / 39 unit/integration tests passing (100.0%)**
