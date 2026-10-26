@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+ENV/
+
+# Large extracted raw directory (safely preserved in external backup)
+data/raw/
+
+# Temporary / Scratch logs
+*.log
+
+# Scratch scripts
+scratch/

@@ -1,0 +1,11 @@
+filename,visual_text,canonical_expression
+sample_01.png,2 + 3 * 4 = 14,2+3*4=14
+sample_02.png,3x + 5 = 20,3*x+5=20
+sample_03.png,(8 - 2) / 2 = 3,(8-2)/2=3
+sample_04.png,x^2 - 5x + 6 = 0,x**2-5*x+6=0
+sample_05.png,7 - 2x = 1,7-2*x=1
+sample_06.png,4x + 8 = 24,4*x+8=24
+sample_07.png,15 / (2 + 1) = 5,15/(2+1)=5
+sample_08.png,x + 9 = 12,x+9=12
+sample_09.png,6 * 7 - 10 = 32,6*7-10=32
+sample_10.png,2x - 7 = 3,2*x-7=3

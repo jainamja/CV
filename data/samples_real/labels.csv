@@ -1,0 +1,11 @@
+filename,expression,canonical_expression,category
+real_01.png,2*x + 5 = 15,2*x + 5 = 15,linear
+real_02.png,3*(x - 4) = 18,3*(x - 4) = 18,linear
+real_03.png,x^2 - 5*x + 6 = 0,x**2 - 5*x + 6 = 0,quadratic
+real_04.png,(12 + 8) / 4 = 5,(12 + 8) / 4 = 5,arithmetic
+real_05.png,7 * 8 - 9 = 47,7 * 8 - 9 = 47,arithmetic
+real_06.png,4*x - 7 = 21,4*x - 7 = 21,linear
+real_07.png,x^2 + 4*x - 21 = 0,x**2 + 4*x - 21 = 0,quadratic
+real_08.png,15 - 3 * 4 = 3,15 - 3 * 4 = 3,arithmetic
+real_09.png,2*(x + 3) = 14,2*(x + 3) = 14,linear
+real_10.png,x^2 - 9 = 0,x**2 - 9 = 0,quadratic
