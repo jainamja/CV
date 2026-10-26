@@ -47,8 +47,8 @@ PREPROCESS_CONFIG: Dict[str, Any] = {
     "approx_poly_epsilon_ratio": 0.02, # Epsilon factor for approxPolyDP (2% of perimeter)
 
     # 3. Gaussian Blur Settings
-    # Gaussian kernel removes high-frequency thermal & sensor noise before thresholding
-    "blur_kernel_size": (5, 5),     # Must be odd dimensions
+    # Light Gaussian kernel removes high-frequency thermal & sensor noise without fattening thin strokes
+    "blur_kernel_size": (3, 3),     # Compact kernel to preserve crisp 1-2px stroke widths
     "blur_sigma_x": 0,              # 0 indicates sigma calculated from kernel dimensions
 
     # 4. Adaptive Threshold Settings
@@ -58,7 +58,7 @@ PREPROCESS_CONFIG: Dict[str, Any] = {
     "adaptive_method": cv2.ADAPTIVE_THRESH_GAUSSIAN_C, # Gaussian weighting around local neighborhood
     "adaptive_type": cv2.THRESH_BINARY_INV,
     "adaptive_block_size": 15,      # Neighborhood size in pixels (must be odd > 1)
-    "adaptive_c": 4,                # Constant subtracted from weighted mean (tunes sensitivity)
+    "adaptive_c": 8,                # Higher C value prevents thin strokes from blooming into thick blobs
 
     # 5. Global & Otsu Comparison Settings
     "global_thresh_val": 127,       # Midpoint value for naive binary thresholding
@@ -67,7 +67,7 @@ PREPROCESS_CONFIG: Dict[str, Any] = {
     # Opening (erosion followed by dilation) eliminates isolated single-pixel salt noise.
     # Closing (dilation followed by erosion) bridges micro gaps caused by dry ink strokes.
     "morph_kernel_open": (2, 2),    # Compact kernel to remove micro noise without thinning strokes
-    "morph_kernel_close": (3, 3),   # Bridges broken handwriting strokes
+    "morph_kernel_close": (2, 2),   # Bridges broken handwriting strokes without blooming
     
     # 7. Deskew Settings
     "deskew_enabled": False,        # Optional orientation rectification
@@ -345,8 +345,8 @@ def compare_thresholds(gray: np.ndarray, config: Optional[Dict[str, Any]] = None
     t_val = cfg.get("global_thresh_val", 127)
     _, global_thresh = cv2.threshold(blurred, t_val, 255, cv2.THRESH_BINARY_INV)
 
-    # 2. Otsu Thresholding
-    _, otsu_thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # 2. Otsu Thresholding (computed on grayscale to preserve crisp, thin stroke width)
+    _, otsu_thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     # 3. Adaptive Gaussian Thresholding
     adaptive_thresh = apply_adaptive_threshold(blurred, cfg)

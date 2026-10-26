@@ -28,11 +28,19 @@ Supported Problem Classes:
 
 import re
 from typing import Dict, Any, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import sympy as sp
 from sympy import symbols, Eq, solve, sympify, latex, degree, Poly, simplify, Rational
 
 
 x = symbols("x")
+
+
+def safe_solve(eq: Any, sym: Any, timeout_sec: float = 3.0) -> List[Any]:
+    """Runs SymPy solve with a strict timeout to prevent indefinite hangs on transcendental equations."""
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(solve, eq, sym)
+        return future.result(timeout=timeout_sec)
 
 
 def solve_arithmetic_steps(expr_str: str) -> Dict[str, Any]:
@@ -365,9 +373,9 @@ def solve_expression(expr_str: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
-            # General algebraic fallback
+            # General algebraic fallback with timeout protection
             try:
-                roots = solve(Eq(lhs_sym, rhs_sym), x)
+                roots = safe_solve(Eq(lhs_sym, rhs_sym), x, timeout_sec=3.0)
                 roots_latex = ", ".join([f"x = {sp.latex(r)}" for r in roots])
                 return {
                     "status": "solved",

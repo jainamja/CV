@@ -34,9 +34,10 @@ import cv2
 SEGMENT_CONFIG: Dict[str, Any] = {
     # 1. Noise Rejection
     # Rejects minuscule specks (e.g. paper grain, dust)
-    "min_contour_area": 25,         # Absolute minimum pixel area
-    "min_height_ratio": 0.03,       # Min height relative to total image height
-    "min_width_pixels": 3,          # Rejects 1-pixel wide vertical noise lines
+    "min_contour_area": 10,         # Absolute minimum pixel area
+    "min_height_ratio": 0.02,       # Min height relative to total image height
+    "min_width_pixels": 2,          # Rejects 1-pixel wide vertical noise lines
+    "min_stroke_pixels": 8,         # Minimum foreground pixels to reject dust specks
 
     # 2. Multi-Part Symbol Merging (Vital for '=', '÷')
     # Horizontal overlap ratio: overlap_x / min(w1, w2)
@@ -47,7 +48,7 @@ SEGMENT_CONFIG: Dict[str, Any] = {
 
     # 3. Square Padding & Normalization
     "target_size": (45, 45),        # CNN standard input dimension (height, width)
-    "padding_margin_ratio": 0.18,   # Margin padding (18%) to ensure strokes don't touch boundaries
+    "padding_margin_ratio": 0.04,   # Margin padding (4%) to match Kaggle character scale (~41px/45px)
     "interpolation_down": cv2.INTER_AREA,
     "interpolation_up": cv2.INTER_CUBIC,
 
@@ -89,17 +90,24 @@ def find_symbol_contours(
     if not contours:
         return []
 
-    min_area = cfg.get("min_contour_area", 25)
-    min_h = max(4, int(img_h * cfg.get("min_height_ratio", 0.03)))
-    min_w = cfg.get("min_width_pixels", 3)
+    min_area = cfg.get("min_contour_area", 10)
+    min_stroke_pixels = cfg.get("min_stroke_pixels", 8)
+    min_h = max(3, int(img_h * cfg.get("min_height_ratio", 0.02)))
+    min_w = cfg.get("min_width_pixels", 2)
 
     valid_boxes: List[Tuple[int, int, int, int]] = []
     for cnt in contours:
-        area = cv2.contourArea(cnt)
         x, y, w, h = cv2.boundingRect(cnt)
 
-        # Noise filter: reject specks that are too tiny in area or height
-        if area < min_area or h < min_h or w < min_w:
+        # Noise filter: reject minuscule specks that are too tiny in span or foreground pixel count.
+        # Note on cv2.contourArea: Open/thin handwritten strokes (1-2 px thick) have degenerate
+        # polygon contours whose enclosed shoelace polygon area (cv2.contourArea) is ~0.
+        # We reject minuscule noise using bounding box span and actual ink pixel count (cv2.countNonZero).
+        if max(w, h) < 6 or min(w, h) < 1:
+            continue
+
+        stroke_pixels = cv2.countNonZero(binary_img[y:y+h, x:x+w])
+        if stroke_pixels < min_stroke_pixels:
             continue
 
         valid_boxes.append((x, y, w, h))
@@ -267,7 +275,7 @@ def normalize_symbol_crop(
     """
     cfg = config or SEGMENT_CONFIG
     target_h, target_w = cfg.get("target_size", (45, 45))
-    margin_ratio = cfg.get("padding_margin_ratio", 0.18)
+    margin_ratio = cfg.get("padding_margin_ratio", 0.04)
 
     img_h, img_w = binary_img.shape[:2]
     x, y, w, h = box

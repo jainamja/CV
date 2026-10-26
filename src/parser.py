@@ -272,7 +272,7 @@ def detect_exponents(
 
     augmented_symbols: List[str] = [symbols[0]]
     base_candidates = {"x", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ")"}
-    exp_candidates = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "x"}
+    exp_candidates = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
 
     for i in range(1, len(symbols)):
         prev_sym = symbols[i - 1]
@@ -281,7 +281,7 @@ def detect_exponents(
         px, py, pw, ph = boxes[i - 1]
         cx, cy, cw, ch = boxes[i]
 
-        # Check eligibility
+        # Check eligibility: only digits or x can be exponents
         if prev_sym in base_candidates and curr_sym in exp_candidates:
             # Vertical elevation check: current centroid is significantly higher than base
             curr_y_center = cy + 0.5 * ch
@@ -290,11 +290,14 @@ def detect_exponents(
             # Relative scale check: exponent is smaller than base
             is_smaller = ch <= 0.85 * ph
 
+            # Baseline elevation check: exponent baseline bottom must be raised above base symbol's baseline
+            is_baseline_elevated = (cy + ch) <= (py + 0.78 * ph)
+
             # Proximity check: horizontal gap is reasonably small
             h_gap = cx - (px + pw)
-            is_close_h = h_gap < pw * 1.5
+            is_close_h = -0.3 * pw <= h_gap < pw * 1.5
 
-            if curr_y_center < base_upper_region and (is_smaller or curr_y_center < py + 0.25 * ph) and is_close_h:
+            if curr_y_center < base_upper_region and is_baseline_elevated and (is_smaller or curr_y_center < py + 0.25 * ph) and is_close_h:
                 augmented_symbols.append("**")
 
         augmented_symbols.append(curr_sym)

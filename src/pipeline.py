@@ -96,7 +96,7 @@ def run_pipeline(
     cfg = settings or {}
     model_type = cfg.get("model_type", "cnn").lower()
     conf_thresh = cfg.get("confidence_threshold", 0.70)
-    thresh_method = cfg.get("threshold_method", "adaptive").lower()
+    thresh_method = cfg.get("threshold_method", "otsu").lower()
     debug_mode = cfg.get("debug", False)
 
     # -------------------------------------------------------------------------
@@ -119,6 +119,10 @@ def run_pipeline(
     else:
         active_binary = prep["cleaned"]  # Default: Adaptive + Morphology
 
+    # Automatic fallback if adaptive produces empty image
+    if cv2.countNonZero(active_binary) == 0:
+        active_binary = prep["threshold_comparison"]["otsu"]
+
     timings["preprocess_ms"] = (time.perf_counter() - t0) * 1000.0
 
     # -------------------------------------------------------------------------
@@ -128,8 +132,12 @@ def run_pipeline(
     seg_cfg = {**SEGMENT_CONFIG}
     if "min_contour_area" in cfg:
         seg_cfg["min_contour_area"] = cfg["min_contour_area"]
+    if "min_stroke_pixels" in cfg:
+        seg_cfg["min_stroke_pixels"] = cfg["min_stroke_pixels"]
     if "merge_min_h_overlap_ratio" in cfg:
         seg_cfg["merge_min_h_overlap_ratio"] = cfg["merge_min_h_overlap_ratio"]
+    if "padding_margin_ratio" in cfg:
+        seg_cfg["padding_margin_ratio"] = cfg["padding_margin_ratio"]
 
     seg = segment_symbols(active_binary, prep["resized"], seg_cfg)
     boxes = seg["boxes"]
@@ -144,10 +152,15 @@ def run_pipeline(
             "error_message": "No mathematical symbols were detected. Ensure ink is clear on plain paper.",
             "timings": timings,
             "count": 0,
+            "boxes": [],
+            "symbol_crops": [],
+            "annotated_vis": prep["resized"],
             "prep": prep,
             "seg": seg,
+            "active_binary": active_binary,
             "predicted_symbols": [],
             "confidences": [],
+            "symbol_diagnostics": [],
             "is_low_confidence": [],
             "parsed": {"is_valid": False, "error_message": "No symbols detected."},
             "solution": {"status": "error", "final_answer": "No symbols detected."}
@@ -161,6 +174,7 @@ def run_pipeline(
 
     predicted_symbols: List[str] = []
     confidences: List[float] = []
+    probs = None
 
     if model_type == "svm" and models.get("svm") is not None:
         svm = models["svm"]
@@ -185,6 +199,22 @@ def run_pipeline(
             confidences = [0.5] * len(crops)
 
     timings["inference_ms"] = (time.perf_counter() - t0) * 1000.0
+
+    # Collect per-symbol diagnostics
+    symbol_diagnostics = []
+    for i in range(len(predicted_symbols)):
+        top3 = []
+        if probs is not None and i < len(probs):
+            top3_idx = np.argsort(probs[i])[::-1][:3]
+            top3 = [(CLASSES[k], float(probs[i][k])) for k in top3_idx]
+        symbol_diagnostics.append({
+            "index": i,
+            "bbox": boxes[i] if i < len(boxes) else None,
+            "symbol": predicted_symbols[i],
+            "confidence": float(confidences[i]) if i < len(confidences) else 0.0,
+            "top3": top3,
+            "crop_shape": crops[i].shape if i < len(crops) else None
+        })
 
     # -------------------------------------------------------------------------
     # APPLY MANUAL OVERRIDES (if any provided from UI)
@@ -247,6 +277,7 @@ def run_pipeline(
         "annotated_vis": annotated_vis,
         "predicted_symbols": predicted_symbols,
         "confidences": confidences,
+        "symbol_diagnostics": symbol_diagnostics,
         "is_low_confidence": is_low_conf,
         "has_low_confidence": any(is_low_conf),
         "mean_confidence": float(np.mean(confidences)) if confidences else 0.0,

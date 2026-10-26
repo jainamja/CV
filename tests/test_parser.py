@@ -273,3 +273,20 @@ def test_composed_benchmark_artifact_and_metrics():
     assert arith["denominators_verified_220"] is True
 
 
+def test_detect_exponents_does_not_trigger_on_normal_baseline():
+    """
+    REGRESSION TEST:
+    A variable 'x' following a digit '2' on the same baseline (e.g. '2x') must NOT
+    be incorrectly parsed as an exponent ('2**x') even if lowercase 'x' is smaller.
+    """
+    symbols = ["2", "x"]
+    # Digit '2': (x=10, y=50, w=30, h=45) -> baseline bottom at y=95
+    # Variable 'x': (x=45, y=60, w=25, h=35) -> baseline bottom at y=95
+    boxes = [
+        (10, 50, 30, 45),
+        (45, 60, 25, 35)
+    ]
+    augmented = detect_exponents(symbols, boxes)
+    assert augmented == ["2", "x"], f"Expected ['2', 'x'], got {augmented}"
+
+

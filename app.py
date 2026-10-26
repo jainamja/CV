@@ -85,14 +85,14 @@ with st.sidebar:
     with st.expander("🔬 Preprocessing (OpenCV)", expanded=True):
         threshold_method = st.selectbox(
             "Thresholding Method",
-            options=["adaptive", "otsu", "global"],
+            options=["otsu", "adaptive", "global"],
             index=0,
             format_func=lambda x: {
+                "otsu": "Otsu's Thresholding (Bimodal - Recommended)",
                 "adaptive": "Adaptive Gaussian (Local)",
-                "otsu": "Otsu's Thresholding (Bimodal)",
                 "global": "Global Fixed Cutoff (127)"
             }[x],
-            help="Adaptive thresholding handles uneven lighting and paper shadows best."
+            help="Otsu binarization preserves clean 1-2px stroke widths matching the training data distribution."
         )
 
         adaptive_block_size = st.slider(
@@ -103,7 +103,7 @@ with st.sidebar:
 
         adaptive_c = st.slider(
             "Constant C",
-            min_value=1, max_value=15, value=4, step=1,
+            min_value=1, max_value=15, value=8, step=1,
             help="Offset subtracted from weighted neighborhood mean."
         )
 
@@ -111,8 +111,8 @@ with st.sidebar:
     with st.expander("✂️ Segmentation & Merging", expanded=True):
         min_contour_area = st.slider(
             "Min Contour Area (px)",
-            min_value=10, max_value=150, value=25, step=5,
-            help="Filters out tiny ink specks and background dust."
+            min_value=5, max_value=150, value=10, step=5,
+            help="Filters out tiny ink specks and background dust without dropping thin strokes."
         )
 
         merge_overlap_ratio = st.slider(
@@ -259,6 +259,7 @@ with main_tab_solver:
         "adaptive_c": adaptive_c,
         "min_contour_area": min_contour_area,
         "merge_min_h_overlap_ratio": merge_overlap_ratio,
+        "padding_margin_ratio": 0.04,
         "model_type": model_type,
         "confidence_threshold": confidence_threshold,
         "debug": debug_save,
@@ -337,6 +338,86 @@ with main_tab_solver:
                 "One or more symbols were recognized with confidence below your set threshold. Review or edit below.",
                 is_warning=True
             )
+
+        # ---------------------------------------------------------------------
+        # REAL-TIME DIAGNOSTIC MODE (Expandable Section)
+        # ---------------------------------------------------------------------
+        with st.expander("🔍 Real-Time Pipeline Diagnostics", expanded=False):
+            st.markdown("##### 🔬 Pipeline Telemetry & Health Verification")
+
+            orig_img = res["prep"]["original"]
+            active_bin = res.get("active_binary", res["prep"]["cleaned"])
+            fg_pixels = int(cv2.countNonZero(active_bin))
+
+            # Metric telemetry cards
+            d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+            with d_col1:
+                st.markdown("**1. Ingested Image**")
+                st.write(f"• Size: `{orig_img.shape[1]} × {orig_img.shape[0]}` px")
+                st.write(f"• Channels: `{orig_img.shape[2] if orig_img.ndim == 3 else 1}`")
+                st.write(f"• Dtype: `{orig_img.dtype}`")
+                st.write(f"• Mean: `{float(np.mean(orig_img)):.1f}`")
+            with d_col2:
+                st.markdown("**2. Binarization**")
+                st.write(f"• Method: `{threshold_method.upper()}`")
+                st.write(f"• Binary Shape: `{active_bin.shape[1]} × {active_bin.shape[0]}` px")
+                st.write(f"• Ink Pixels: `{fg_pixels}`")
+                st.write(f"• Paper Warped: `{res['prep'].get('paper_detected', False)}`")
+            with d_col3:
+                st.markdown("**3. Segmentation**")
+                st.write(f"• Detected Boxes: `{res['count']}`")
+                st.write(f"• Min Area Threshold: `{min_contour_area}` px")
+                st.write(f"• Stroke Margin: `4%`")
+                st.write(f"• Multi-stroke Merged: `{'Yes' if res['count'] > 0 else 'None'}`")
+            with d_col4:
+                st.markdown("**4. Parsing & Solver**")
+                st.write(f"• Valid Syntax: `{parsed.get('is_valid', False)}`")
+                st.write(f"• Solver Status: `{sol.get('status', 'N/A')}`")
+                st.write(f"• Total Latency: `{timings.get('total_ms', 0.0):.1f} ms`")
+                if parsed.get("error_message"):
+                    st.write(f"• Stage Error: `{parsed.get('error_message')}`")
+
+            # Stage health indicators
+            st.markdown("---")
+            h_col1, h_col2, h_col3, h_col4 = st.columns(4)
+            with h_col1:
+                if orig_img is not None:
+                    st.success("✓ Ingestion: OK")
+                else:
+                    st.error("✗ Ingestion: Failed")
+            with h_col2:
+                if fg_pixels > 0:
+                    st.success(f"✓ Binarization: {fg_pixels} px")
+                else:
+                    st.error("✗ Binarization: 0 ink pixels")
+            with h_col3:
+                if res["count"] > 0:
+                    st.success(f"✓ Segmentation: {res['count']} symbols")
+                else:
+                    st.error("✗ Segmentation: 0 symbols")
+            with h_col4:
+                if parsed.get("is_valid", False):
+                    st.success("✓ Parsing & SymPy: OK")
+                else:
+                    st.warning(f"⚠️ Parsing: {parsed.get('error_message', 'Invalid syntax')}")
+
+            # Per-symbol crop details and confidences
+            if res["count"] > 0 and res.get("symbol_diagnostics"):
+                st.markdown("---")
+                st.markdown("##### 🔠 Symbol Crops & Top-3 Model Candidates")
+                diag_items = res["symbol_diagnostics"]
+                diag_cols = st.columns(min(8, max(1, len(diag_items))))
+                for idx, item in enumerate(diag_items):
+                    with diag_cols[idx % len(diag_cols)]:
+                        if idx < len(res["symbol_crops"]):
+                            crop_disp = (res["symbol_crops"][idx] * 255).astype(np.uint8)
+                            st.image(crop_disp, width=50, caption=f"#{idx+1}")
+                        sym_glyph = LABEL_TO_DISPLAY.get(item['symbol'], item['symbol'])
+                        st.markdown(f"**{sym_glyph}** (`{item['confidence']*100:.1f}%`)")
+                        st.caption(f"Box: {item['bbox'][2]}×{item['bbox'][3]}px")
+                        if item.get("top3"):
+                            t3_str = " | ".join([f"{LABEL_TO_DISPLAY.get(c, c)}:{p*100:.0f}%" for c, p in item["top3"]])
+                            st.caption(f"`{t3_str}`")
 
         # ---------------------------------------------------------------------
         # Editable Recognition Preview Card

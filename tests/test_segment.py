@@ -111,3 +111,32 @@ def test_segment_symbols_end_to_end():
     assert res["count"] == 3
     assert len(res["boxes"]) == 3
     assert len(res["symbol_crops"]) == 3
+
+
+def test_find_symbol_contours_detects_thin_handwritten_strokes():
+    """
+    REGRESSION TEST:
+    Handwritten strokes from gel pens, ballpoint pens, or pencil lines are often
+    1-2 pixels wide. Their enclosed polygon contour area (cv2.contourArea) is ~0.
+    Verify that thin 1-pixel strokes (such as minus signs or 1s) are detected
+    and not discarded by the noise filter.
+    """
+    canvas = np.zeros((100, 100), dtype=np.uint8)
+    # Thin 1-pixel tall horizontal minus sign '-' of width 25
+    canvas[50:51, 30:55] = 255
+    # Thin 1-pixel wide vertical line '1' of height 35
+    canvas[20:55, 75:76] = 255
+
+    boxes = find_symbol_contours(canvas)
+    assert len(boxes) == 2, f"Expected 2 thin stroke boxes, got {len(boxes)}: {boxes}"
+
+
+def test_find_symbol_contours_rejects_single_pixel_noise():
+    """Verify that 1x1 and 2x2 dust specks are rejected as noise."""
+    canvas = np.zeros((100, 100), dtype=np.uint8)
+    # Tiny 1x1 and 2x2 noise specks
+    canvas[10, 10] = 255
+    canvas[20:22, 20:22] = 255
+
+    boxes = find_symbol_contours(canvas)
+    assert len(boxes) == 0, f"Expected 0 noise boxes, got {len(boxes)}"
