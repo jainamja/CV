@@ -60,16 +60,25 @@ PREPROCESS_CONFIG: Dict[str, Any] = {
     "adaptive_block_size": 15,      # Neighborhood size in pixels (must be odd > 1)
     "adaptive_c": 8,                # Higher C value prevents thin strokes from blooming into thick blobs
 
-    # 5. Global & Otsu Comparison Settings
+    # 5. Threshold Selection & Comparison Settings
+    "threshold_method": "adaptive", # Default to local adaptive binarization for lighting & margin robustness
     "global_thresh_val": 127,       # Midpoint value for naive binary thresholding
 
-    # 6. Morphological Refinement
+    # 6. Illumination Flattening Settings (Retinex / Morphological Background Subtraction)
+    "illumination_flattening_enabled": True, # Removes shadows, vignetting, and ambient gradients
+    "illumination_kernel_size": (41, 41),    # Large morphological kernel capturing paper background
+
+    # 7. Morphological Refinement
     # Opening (erosion followed by dilation) eliminates isolated single-pixel salt noise.
     # Closing (dilation followed by erosion) bridges micro gaps caused by dry ink strokes.
-    "morph_kernel_open": (2, 2),    # Compact kernel to remove micro noise without thinning strokes
-    "morph_kernel_close": (2, 2),   # Bridges broken handwriting strokes without blooming
+    "morph_kernel_open": (1, 1),    # (1, 1) preserves delicate 1px crossbars (e.g. in '4'); noise is rejected by CC analysis
+    "morph_kernel_close": (2, 2),   # Compact 2x2 bridges broken strokes without filling small loops (e.g. '6', '8')
     
-    # 7. Deskew Settings
+    # 8. Background Horizontal Line Suppression Settings
+    "line_suppression_enabled": True, # Removes notebook rules, table borders, and scanner boundary bars
+    "line_min_width_ratio": 0.22,     # Minimum length relative to image width to qualify as background line
+
+    # 9. Deskew Settings
     "deskew_enabled": False,        # Optional orientation rectification
     "max_deskew_angle": 30.0,       # Angles beyond 30 deg are likely non-horizontal layouts
 }
@@ -263,6 +272,76 @@ def correct_perspective(
     return warped, True
 
 
+def crop_black_margins(
+    image: np.ndarray,
+    threshold: float = 15.0
+) -> Tuple[np.ndarray, bool, Tuple[int, int, int, int]]:
+    """
+    Detects and crops uniform black/dark margin pillarboxes/letterboxes (e.g. from webcams or screenshots).
+
+    Viva Explanation:
+    Webcam captures and mobile screenshots frequently contain large pitch-black pillarboxes
+    or letterbox padding margins on the borders. Because these dark regions occupy a massive fraction
+    (e.g. 50-60%) of the image pixels with intensity ~0, global binarization algorithms (like Otsu)
+    break down: the global threshold is pulled down into the ink-intensity range, corrupting the
+    paper binarization, completely wiping out faint pencil/pen strokes, and converting the black
+    margins into enormous 80,000+ pixel white noise blocks.
+    Cropping the black margin borders to the active paper bounding box restores the true bimodal
+    distribution between paper (~120-200) and ink (~30-60), enabling clean segmentation of all glyphs.
+
+    Args:
+        image: BGR or Grayscale image array.
+        threshold: Mean intensity cutoff below which an edge row/col is considered black padding.
+
+    Returns:
+        Tuple[np.ndarray, bool, Tuple[int, int, int, int]]:
+            - Cropped image (or original copy if no black margins).
+            - Boolean flag indicating whether black margins were cropped.
+            - (x, y, w, h) bounding rectangle of the retained active region in original coordinates.
+    """
+    if image is None or image.size == 0:
+        return image, False, (0, 0, 0, 0)
+
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+
+    col_means = gray.mean(axis=0)
+    row_means = gray.mean(axis=1)
+
+    valid_cols = np.where(col_means > threshold)[0]
+    valid_rows = np.where(row_means > threshold)[0]
+
+    img_h, img_w = image.shape[:2]
+    if len(valid_cols) == 0 or len(valid_rows) == 0:
+        return image.copy(), False, (0, 0, img_w, img_h)
+
+    x1, x2 = int(valid_cols[0]), int(valid_cols[-1]) + 1
+    y1, y2 = int(valid_rows[0]), int(valid_rows[-1]) + 1
+
+    # Check if substantial black margin was detected (> 5% of width or height)
+    has_left_margin = x1 > int(0.05 * img_w)
+    has_right_margin = (img_w - x2) > int(0.05 * img_w)
+    has_top_margin = y1 > int(0.05 * img_h)
+    has_bottom_margin = (img_h - y2) > int(0.05 * img_h)
+
+    if has_left_margin or has_right_margin or has_top_margin or has_bottom_margin:
+        # Apply a conservative 2px inset away from black margin transition boundaries
+        # to ensure no 1-pixel boundary transition artifacts remain
+        safe_x1 = min(img_w - 1, x1 + 2) if has_left_margin else x1
+        safe_x2 = max(0, x2 - 2) if has_right_margin else x2
+        safe_y1 = min(img_h - 1, y1 + 2) if has_top_margin else y1
+        safe_y2 = max(0, y2 - 2) if has_bottom_margin else y2
+
+        if safe_x2 > safe_x1 + 20 and safe_y2 > safe_y1 + 20:
+            crop = image[safe_y1:safe_y2, safe_x1:safe_x2].copy()
+            bbox = (safe_x1, safe_y1, safe_x2 - safe_x1, safe_y2 - safe_y1)
+            return crop, True, bbox
+
+    return image.copy(), False, (0, 0, img_w, img_h)
+
+
 def to_grayscale(image: np.ndarray) -> np.ndarray:
     """
     Converts BGR image to single-channel 8-bit Grayscale.
@@ -277,13 +356,38 @@ def to_grayscale(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
 
+def flatten_illumination(gray: np.ndarray, config: Optional[Dict[str, Any]] = None) -> np.ndarray:
+    """
+    Normalizes uneven paper background illumination, vignetting, and shadows via morphological division.
+
+    Viva Explanation:
+    Handheld camera captures and webcam images inherently suffer from lighting gradients,
+    shadows, and vignetting (dark corners). A fixed or naive threshold fails because
+    shadows in corners are darker than ink strokes in well-lit areas.
+    By applying a large morphological dilation (kernel size 41x41), we filter out thin
+    character strokes (< 20px wide) and obtain an estimated smooth paper background illumination
+    field B(x, y). Dividing the grayscale image by this background field flattens the paper
+    surface to uniform white (255) while preserving thin, faint pencil/pen strokes, enabling
+    clean binarization without edge shadows or lost strokes.
+    """
+    cfg = config or PREPROCESS_CONFIG
+    if not cfg.get("illumination_flattening_enabled", True):
+        return gray.copy()
+
+    ksize = cfg.get("illumination_kernel_size", (41, 41))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, ksize)
+    bg = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel)
+    norm = np.clip((gray.astype(np.float32) / np.maximum(bg.astype(np.float32), 1.0)) * 255.0, 0, 255).astype(np.uint8)
+    return norm
+
+
 def apply_gaussian_blur(gray: np.ndarray, config: Optional[Dict[str, Any]] = None) -> np.ndarray:
     """
     Applies 2D Gaussian filter for isotropic noise smoothing.
 
     Viva Explanation:
     Thresholding without prior smoothing leads to ragged edges and salt-and-pepper noise
-    because high-frequency camera noise crosses the threshold threshold boundary.
+    because high-frequency camera noise crosses the threshold boundary.
     Gaussian convolution acts as a low-pass filter, attenuating pixel-level variance.
     """
     cfg = config or PREPROCESS_CONFIG
@@ -311,7 +415,7 @@ def apply_adaptive_threshold(blurred: np.ndarray, config: Optional[Dict[str, Any
     method = cfg.get("adaptive_method", cv2.ADAPTIVE_THRESH_GAUSSIAN_C)
     thresh_type = cfg.get("adaptive_type", cv2.THRESH_BINARY_INV)
     block_size = cfg.get("adaptive_block_size", 15)
-    c_val = cfg.get("adaptive_c", 4)
+    c_val = cfg.get("adaptive_c", 8)
 
     # Ensure block_size is odd and greater than 1
     if block_size % 2 == 0:
@@ -327,26 +431,26 @@ def compare_thresholds(gray: np.ndarray, config: Optional[Dict[str, Any]] = None
     Generates Global, Otsu, and Adaptive thresholding results side-by-side.
 
     Viva Explanation:
-    This comparison function demonstrates why adaptive thresholding is chosen:
-    1. Global Thresholding (fixed threshold T=127): Fails when lighting is dim or bright.
+    This comparison function demonstrates why adaptive and normalized Otsu thresholding are chosen:
+    1. Global Thresholding (fixed threshold T=127): Evaluated on blurred normalized gray.
     2. Otsu's Thresholding: Automatically minimizes intra-class variance assuming a bimodal
-       histogram. Effective under uniform illumination, but fails when lighting gradients
-       create non-bimodal distributions across the document.
-    3. Adaptive Gaussian Thresholding: Operates locally, maintaining consistent stroke width
-       even under sharp shadow lines.
+       histogram. Computed on illumination-normalized grayscale to preserve crisp, thin stroke width
+       and completely eliminate boundary lighting gradients.
+    3. Adaptive Gaussian Thresholding: Operates locally, maintaining consistent stroke width.
 
     Returns:
         Dict[str, np.ndarray]: Mapping of threshold names to inverted binary images.
     """
     cfg = config or PREPROCESS_CONFIG
-    blurred = apply_gaussian_blur(gray, cfg)
+    norm_gray = flatten_illumination(gray, cfg)
+    blurred = apply_gaussian_blur(norm_gray, cfg)
 
-    # 1. Plain Global Thresholding
+    # 1. Plain Global Thresholding on normalized image
     t_val = cfg.get("global_thresh_val", 127)
     _, global_thresh = cv2.threshold(blurred, t_val, 255, cv2.THRESH_BINARY_INV)
 
-    # 2. Otsu Thresholding (computed on grayscale to preserve crisp, thin stroke width)
-    _, otsu_thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # 2. Otsu Thresholding (computed on illumination-normalized grayscale to preserve crisp, thin stroke width)
+    _, otsu_thresh = cv2.threshold(norm_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     # 3. Adaptive Gaussian Thresholding
     adaptive_thresh = apply_adaptive_threshold(blurred, cfg)
@@ -371,20 +475,226 @@ def apply_morphology(binary_img: np.ndarray, config: Optional[Dict[str, Any]] = 
       markings or rapid pen movements.
     """
     cfg = config or PREPROCESS_CONFIG
-    k_open = cfg.get("morph_kernel_open", (2, 2))
-    k_close = cfg.get("morph_kernel_close", (3, 3))
+    k_open = cfg.get("morph_kernel_open", (1, 1))
+    k_close = cfg.get("morph_kernel_close", (2, 2))
 
-    # Structuring elements
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, k_open)
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, k_close)
+    current = binary_img.copy()
 
-    # Step 1: Remove isolated foreground noise
-    opened = cv2.morphologyEx(binary_img, cv2.MORPH_OPEN, kernel_open)
+    # Step 1: Remove isolated foreground noise (only if kernel > (1, 1))
+    if k_open[0] > 1 and k_open[1] > 1:
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, k_open)
+        current = cv2.morphologyEx(current, cv2.MORPH_OPEN, kernel_open)
 
     # Step 2: Bridge hairline gaps in strokes
-    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel_close)
+    if k_close[0] > 1 or k_close[1] > 1:
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, k_close)
+        current = cv2.morphologyEx(current, cv2.MORPH_CLOSE, kernel_close)
 
-    return closed
+    return current
+
+
+def suppress_horizontal_lines(
+    binary_img: np.ndarray,
+    config: Optional[Dict[str, Any]] = None
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    Suppresses long horizontal background lines, notebook rules, and scanner boundary bars
+    while strictly preserving legitimate handwritten operators (minus '-', plus '+',
+    division '÷', equals '=') and character loops.
+
+    Viva Explanation:
+    Ruled notebook paper, table borders, and document scanner edge bands create long,
+    continuous horizontal structures. When left unsuppressed, these structures:
+    1. Intersect or vertically bridge multiple characters, causing transitive contour
+       clustering to coalesce the entire expression into a single oversized bounding box.
+    2. Distort learned CNN features, causing merged crops to be erroneously classified
+       as '=' with high false confidence.
+    To distinguish background lines from legitimate handwritten strokes:
+    - Scale-Aware Minimum Length: Mathematical operator strokes ('-', '+', '÷', '=')
+      rarely exceed 10-15% of the writing canvas width (typically 15-40px). Background
+      rules and page borders span 22-100% of the canvas width (>= 45px).
+    - Morphological Filtering: A horizontal structuring element of length L = max(45, 0.22*W)
+      isolates lines longer than L, leaving all characters and operators untouched.
+    - Connected Component Aspect Analysis: Components with aspect ratio w/h >= 6.0 and
+      width >= L are flagged as lines.
+    - Vertical Stroke Bridging: Where a genuine vertical stroke (e.g. '|' in '+', '4', '1')
+      crossed a notebook line, subtracting the line creates a 1-2px gap. Vertical closing
+      bridges this hairline intersection, preserving stroke continuity.
+
+    Args:
+        binary_img: Single-channel inverted binary image (ink = 255, background = 0).
+        config: Tunable settings dictionary.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+            - Cleaned binary image with horizontal lines suppressed.
+            - Detected horizontal line mask (ink = 255).
+            - Diagnostic metadata dictionary.
+    """
+    if binary_img is None or binary_img.size == 0:
+        return binary_img, np.zeros_like(binary_img), {"lines_detected": False, "pixels_removed": 0, "min_line_len": 45}
+
+    cfg = config or PREPROCESS_CONFIG
+    img_h, img_w = binary_img.shape[:2]
+
+    min_line_len = max(35, int(img_w * cfg.get("line_min_width_ratio", 0.18)))
+
+    # 1. Morphological horizontal opening isolates continuous horizontal lines >= min_line_len
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_line_len, 1))
+    morph_lines = cv2.morphologyEx(binary_img, cv2.MORPH_OPEN, horiz_kernel)
+
+    # 2. Connected-component candidate lines (captures slightly fragmented or non-uniform lines)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_img, connectivity=8)
+    cc_lines = np.zeros_like(binary_img)
+    for i in range(1, num_labels):
+        cx = stats[i, cv2.CC_STAT_LEFT]
+        cy = stats[i, cv2.CC_STAT_TOP]
+        cw = stats[i, cv2.CC_STAT_WIDTH]
+        ch = stats[i, cv2.CC_STAT_HEIGHT]
+        aspect = float(cw) / max(1, ch)
+        if cw >= min_line_len and aspect >= 6.0 and ch <= 10:
+            cc_lines[labels == i] = 255
+
+        # Border & boundary-zone line remnants (e.g. page/notebook rules near image perimeter)
+        touches_border = (cx <= 2 or (cx + cw) >= img_w - 2 or cy <= 2 or (cy + ch) >= img_h - 2)
+        is_boundary_zone = (cy >= int(0.70 * img_h) or (cy + ch) <= int(0.18 * img_h))
+        if (touches_border or is_boundary_zone) and aspect >= 6.0 and ch <= 5 and cw >= 35:
+            cc_lines[labels == i] = 255
+
+    # 3. Combined line mask with conservative vertical dilation (2-3px) to capture line boundaries
+    line_mask = cv2.bitwise_or(morph_lines, cc_lines)
+    pixels_removed = int(cv2.countNonZero(line_mask))
+
+    if pixels_removed > 0:
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+        dilated_mask = cv2.dilate(line_mask, kernel_v)
+        # 4. Subtract line mask
+        cleaned = cv2.bitwise_and(binary_img, cv2.bitwise_not(dilated_mask))
+        # 5. Bridge hairline vertical fractures where vertical character strokes crossed the line
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)))
+    else:
+        dilated_mask = line_mask
+        cleaned = binary_img.copy()
+
+    stats_dict = {
+        "lines_detected": pixels_removed > 0,
+        "pixels_removed": pixels_removed,
+        "min_line_len": min_line_len
+    }
+    return cleaned, dilated_mask, stats_dict
+
+
+def detect_equation_writing_region(
+    binary_img: np.ndarray,
+    config: Optional[Dict[str, Any]] = None
+) -> Tuple[int, int, bool, Dict[str, Any]]:
+    """
+    Identifies the vertical span [y1, y2] of the primary equation writing region,
+    excluding distant page borders, scanner rules, and table margins.
+
+    Viva Explanation:
+    Handwritten mathematical expressions naturally form a coherent horizontal text line
+    composed of distinct, character-sized connected components. In contrast, paper/table
+    boundaries and dark scanner letterboxes consist of large continuous dark masses or
+    isolated border slivers separated from the equation by wide empty gaps (> 1.2x line height).
+    Rather than naively counting raw foreground pixels (which biases detection toward dark
+    border noise), this algorithm uses connected-component structural filtering:
+    1. Identifies plausible character candidates (bounded aspect ratio, character scale).
+    2. Clusters character candidates sharing a horizontal baseline into text lines.
+    3. Mandates validity checks: the selected writing region must contain >= 2 characters
+       and preserve >= 70% of all detected character candidates.
+    4. If any check fails or no distant outlier boundaries exist, falls back safely to
+       the full uncropped paper canvas (zero silent crop failures).
+    """
+    if binary_img is None or binary_img.size == 0:
+        return 0, 0, False, {"status": "empty_input"}
+
+    img_h, img_w = binary_img.shape[:2]
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_img, connectivity=8)
+
+    char_candidates = []
+    outlier_candidates = []
+
+    for i in range(1, num_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+        aspect = float(w) / max(1, h)
+
+        # Plausible character criteria
+        is_char = (h >= 8 and h <= 0.70 * img_h and w >= 3 and w <= 0.65 * img_w and aspect >= 0.15 and aspect <= 4.0 and area >= 18)
+        touches_border = (x <= 1 or (x + w) >= img_w - 1 or y <= 1 or (y + h) >= img_h - 1)
+        is_border_blob = touches_border and (h > 0.35 * img_h or w > 0.35 * img_w or aspect > 3.0 or area > 300)
+
+        if is_char and not is_border_blob:
+            char_candidates.append({'bbox': (x, y, w, h), 'area': area, 'y_mid': y + h / 2.0, 'y1': y, 'y2': y + h, 'x1': x, 'x2': x + w})
+        else:
+            outlier_candidates.append({'bbox': (x, y, w, h), 'area': area, 'y1': y, 'y2': y + h})
+
+    if len(char_candidates) < 2:
+        return 0, img_h, False, {'status': 'insufficient_chars'}
+
+    # Group characters into text-line clusters
+    char_candidates.sort(key=lambda c: c['y_mid'])
+    clusters = []
+    for c in char_candidates:
+        assigned = False
+        for cl in clusters:
+            cl_med_h = np.median([ch['bbox'][3] for ch in cl])
+            cl_med_ymid = np.median([ch['y_mid'] for ch in cl])
+            if abs(c['y_mid'] - cl_med_ymid) <= max(18, int(1.2 * cl_med_h)):
+                cl.append(c)
+                assigned = True
+                break
+        if not assigned:
+            clusters.append([c])
+
+    scored_clusters = []
+    for cl in clusters:
+        count = len(cl)
+        x_span = max(c['x2'] for c in cl) - min(c['x1'] for c in cl)
+        tot_area = sum(c['area'] for c in cl)
+        score = count * 1000 + x_span + tot_area
+        y1 = min(c['y1'] for c in cl)
+        y2 = max(c['y2'] for c in cl)
+        scored_clusters.append((score, count, y1, y2, cl))
+
+    scored_clusters.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_count, best_y1, best_y2, best_chars = scored_clusters[0]
+
+    # Mandatory validity check: primary writing line must have >= 2 characters or significant glyph
+    if best_count < 2 and best_chars[0]['area'] < 50:
+        return 0, img_h, False, {'status': 'single_small_char'}
+
+    line_h = best_y2 - best_y1
+    # Check if there are distant outlier components (e.g. table border below or header rule above)
+    has_bottom_outlier = any(o['y1'] >= best_y2 + max(35, int(1.2 * line_h)) for o in outlier_candidates)
+    has_top_outlier = any(o['y2'] <= best_y1 - max(35, int(1.2 * line_h)) for o in outlier_candidates)
+
+    if not has_bottom_outlier and not has_top_outlier:
+        return 0, img_h, False, {'status': 'no_outlier_boundaries'}
+
+    pad = max(20, int(0.40 * line_h))
+    y_top = max(0, int(best_y1 - pad)) if has_top_outlier else 0
+    y_bot = min(img_h, int(best_y2 + pad)) if has_bottom_outlier else img_h
+
+    # Priority 2: Ensure writing is preserved in proposed crop
+    chars_inside = sum(1 for c in char_candidates if c['y_mid'] >= y_top and c['y_mid'] <= y_bot)
+    if chars_inside < 0.70 * len(char_candidates):
+        return 0, img_h, False, {'status': 'rejected_dropped_chars'}
+
+    return y_top, y_bot, True, {'status': 'applied', 'best_count': best_count, 'char_span': (int(best_y1), int(best_y2))}
+
+
+def detect_writing_region_bounds(
+    binary_img: np.ndarray,
+    config: Optional[Dict[str, Any]] = None
+) -> Tuple[int, int]:
+    """Compatibility wrapper returning (y_top, y_bot) for writing region detection."""
+    y1, y2, _, _ = detect_equation_writing_region(binary_img, config)
+    return y1, y2
 
 
 def deskew_image(binary_img: np.ndarray, config: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, float]:
@@ -478,30 +788,90 @@ def preprocess_pipeline(
     warped, paper_detected = correct_perspective(resized, cfg)
     working_bgr = warped if paper_detected else resized
 
+    # 3.5. Black/dark margin pillarbox & letterbox auto-cropping
+    active_bgr, margin_cropped, margin_bbox = crop_black_margins(working_bgr)
+
     # 4. Grayscale & Noise reduction
-    gray = to_grayscale(working_bgr)
-    blurred = apply_gaussian_blur(gray, cfg)
+    gray = to_grayscale(active_bgr)
+    norm_gray = flatten_illumination(gray, cfg)
+    blurred = apply_gaussian_blur(norm_gray, cfg)
 
     # 5. Threshold comparisons (Global vs Otsu vs Adaptive)
     thresh_comp = compare_thresholds(gray, cfg)
-    binary = thresh_comp["adaptive"]
+    thresh_method = cfg.get("threshold_method", "adaptive").lower()
+    raw_selected = thresh_comp.get(thresh_method, thresh_comp["adaptive"])
+    binary = raw_selected
 
     # 6. Morphological filtering (remove speckles & join strokes)
     cleaned = apply_morphology(binary, cfg)
 
+    # 6.5. Horizontal background-line / notebook rule suppression
+    binary_before_line_suppression = cleaned.copy()
+    if cfg.get("line_suppression_enabled", True):
+        cleaned, horiz_line_mask, line_stats = suppress_horizontal_lines(cleaned, cfg)
+    else:
+        horiz_line_mask = np.zeros_like(cleaned)
+        line_stats = {"lines_detected": False, "pixels_removed": 0, "min_line_len": 45}
+
+    cleaned_comp = {}
+    for name, b_img in thresh_comp.items():
+        m_img = apply_morphology(b_img, cfg)
+        if cfg.get("line_suppression_enabled", True):
+            c_img, _, _ = suppress_horizontal_lines(m_img, cfg)
+        else:
+            c_img = m_img
+        cleaned_comp[name] = c_img
+
+    # 6.6. Tighten writing region: exclude distant table/scanner boundary noise outside equation writing line
+    y_top, y_bot, writing_crop_applied, writing_diag = detect_equation_writing_region(cleaned, cfg)
+
+    # Visualization of margin crop with detected writing bounds drawn on it
+    margin_crop_with_bounds = active_bgr.copy()
+    if writing_crop_applied:
+        cv2.rectangle(margin_crop_with_bounds, (0, y_top), (active_bgr.shape[1] - 1, y_bot - 1), (0, 220, 130), 2)
+        cv2.putText(margin_crop_with_bounds, f"Writing Region: y=[{y_top}:{y_bot}]", (5, max(15, y_top - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 130), 1)
+
+    if writing_crop_applied:
+        final_binary = cleaned[y_top:y_bot, :].copy()
+        final_resized = active_bgr[y_top:y_bot, :].copy()
+        final_active_crop = active_bgr[y_top:y_bot, :].copy()
+        final_binary_before = binary_before_line_suppression[y_top:y_bot, :].copy()
+        final_horiz_mask = horiz_line_mask[y_top:y_bot, :].copy()
+        final_cleaned_comp = {name: c_img[y_top:y_bot, :].copy() for name, c_img in cleaned_comp.items()}
+    else:
+        final_binary = cleaned
+        final_resized = active_bgr
+        final_active_crop = active_bgr
+        final_binary_before = binary_before_line_suppression
+        final_horiz_mask = horiz_line_mask
+        final_cleaned_comp = cleaned_comp
+
     # 7. Orientation deskew
-    deskewed, skew_angle = deskew_image(cleaned, cfg)
+    deskewed, skew_angle = deskew_image(final_binary, cfg)
 
     return {
         "original": original,
-        "resized": resized,
+        "resized": final_resized,
+        "active_crop": final_active_crop,
+        "margin_crop_image": active_bgr,
+        "margin_crop_with_bounds": margin_crop_with_bounds,
+        "writing_crop_applied": writing_crop_applied,
+        "writing_bounds": (int(y_top), int(y_bot)),
+        "writing_diag": writing_diag,
         "perspective_warped": warped if paper_detected else None,
         "paper_detected": paper_detected,
+        "margin_crop_applied": margin_cropped,
+        "margin_crop_bbox": margin_bbox,
         "gray": gray,
         "blurred": blurred,
         "threshold_comparison": thresh_comp,
-        "binary": binary,
-        "cleaned": cleaned,
+        "threshold_comparison_cleaned": final_cleaned_comp,
+        "binary_before_line_suppression": final_binary_before,
+        "horizontal_line_mask": final_horiz_mask,
+        "line_suppression_stats": line_stats,
+        "binary": final_binary,
+        "cleaned": final_binary,
         "deskewed": deskewed,
         "skew_angle": skew_angle
     }

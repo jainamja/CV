@@ -451,3 +451,31 @@ header { visibility: hidden; }
     color: var(--text-muted);
     font-size: 0.8rem;
 }
+
+/* ==========================================================================
+   Webcam Capture Component Styling (Responsive & Centered)
+   ========================================================================== */
+div[data-testid="stCameraInput"] {
+    width: 100% !important;
+    max-width: 560px !important;
+    margin: 0 auto !important;
+}
+
+div[data-testid="stCameraInput"] video {
+    width: 100% !important;
+    max-height: 360px !important;
+    object-fit: contain !important;
+    border-radius: var(--radius-md) !important;
+}
+
+div[data-testid="stCameraInput"] img {
+    width: 100% !important;
+    max-height: 360px !important;
+    object-fit: contain !important;
+    border-radius: var(--radius-md) !important;
+}
+
+div[data-testid="stCameraInput"] button[data-testid="stCameraInputButton"] {
+    margin: 10px auto 0 auto !important;
+    display: block !important;
+}

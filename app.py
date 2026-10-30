@@ -11,16 +11,17 @@ deep learning (CNN), Bayesian grammar rescoring, and SymPy.
 
 import os
 import glob
+import hashlib
 from datetime import datetime
 import cv2
 import numpy as np
 import sympy as sp
 import streamlit as st
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
 
 from src.pipeline import run_pipeline, get_loaded_models, create_results_zip
-from src.solver import solve_expression
+from src.parser import validate_expression, to_latex
+from src.solver import solve_expression, safe_latex, safe_str
 from src.dataset import CLASSES, LABEL_TO_DISPLAY
 from ui.components import (
     render_hero_header,
@@ -64,10 +65,22 @@ models = load_all_models()
 # Initialize session state variables
 if "current_image" not in st.session_state:
     st.session_state.current_image = None
+if "current_image_hash" not in st.session_state:
+    st.session_state.current_image_hash = None
 if "manual_overrides" not in st.session_state:
     st.session_state.manual_overrides = {}
+if "last_applied_overrides" not in st.session_state:
+    st.session_state.last_applied_overrides = {}
 if "selected_sample" not in st.session_state:
     st.session_state.selected_sample = None
+if "active_source" not in st.session_state:
+    st.session_state.active_source = "upload"
+if "last_upload_hash" not in st.session_state:
+    st.session_state.last_upload_hash = None
+if "last_camera_hash" not in st.session_state:
+    st.session_state.last_camera_hash = None
+if "last_settings" not in st.session_state:
+    st.session_state.last_settings = {}
 if "pipeline_results" not in st.session_state:
     st.session_state.pipeline_results = None
 if "history" not in st.session_state:
@@ -85,14 +98,15 @@ with st.sidebar:
     with st.expander("🔬 Preprocessing (OpenCV)", expanded=True):
         threshold_method = st.selectbox(
             "Thresholding Method",
-            options=["otsu", "adaptive", "global"],
+            options=["auto", "adaptive", "otsu", "global"],
             index=0,
             format_func=lambda x: {
-                "otsu": "Otsu's Thresholding (Bimodal - Recommended)",
+                "auto": "Auto (Multi-Threshold Arbitration - Recommended)",
                 "adaptive": "Adaptive Gaussian (Local)",
+                "otsu": "Otsu's Thresholding (Bimodal)",
                 "global": "Global Fixed Cutoff (127)"
             }[x],
-            help="Otsu binarization preserves clean 1-2px stroke widths matching the training data distribution."
+            help="Auto binarization evaluates both adaptive and Otsu thresholds to pick the cleanest result."
         )
 
         adaptive_block_size = st.slider(
@@ -155,10 +169,9 @@ render_hero_header()
 # =============================================================================
 # 5. TOP NAVIGATION TABS
 # =============================================================================
-main_tab_solver, main_tab_history, main_tab_viva = st.tabs([
+main_tab_solver, main_tab_history = st.tabs([
     "🧮 Equation Solver",
-    "📜 Session History",
-    "🎓 About & Viva Guide"
+    "📜 Session History"
 ])
 
 
@@ -167,12 +180,11 @@ main_tab_solver, main_tab_history, main_tab_viva = st.tabs([
 # =============================================================================
 with main_tab_solver:
     st.markdown("#### 1. Input Acquisition")
-    st.markdown("<p style='color:var(--text-secondary); font-size:0.88rem;'>Choose an input source: upload a photo, use your webcam, draw in the sketchpad, or select a pre-loaded equation sample.</p>", unsafe_allow_html=True)
+    st.markdown("<p style='color:var(--text-secondary); font-size:0.88rem;'>Choose an input source: upload a photo, use your webcam, or select a pre-loaded equation sample.</p>", unsafe_allow_html=True)
 
-    tab_upload, tab_camera, tab_canvas = st.tabs([
+    tab_upload, tab_camera = st.tabs([
         "📁 Upload Image",
-        "📷 Live Webcam",
-        "✏️ Draw on Canvas"
+        "📷 Live Webcam"
     ])
 
     input_image_to_process = None
@@ -185,53 +197,48 @@ with main_tab_solver:
             key="file_uploader"
         )
         if uploaded_file is not None:
-            file_bytes = uploaded_file.read()
-            nparr = np.frombuffer(file_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is not None:
-                input_image_to_process = img
-                st.session_state.selected_sample = None
+            file_bytes = uploaded_file.getvalue()
+            if file_bytes:
+                up_hash = hashlib.md5(file_bytes).hexdigest()
+                if st.session_state.get("last_upload_hash") != up_hash:
+                    st.session_state.last_upload_hash = up_hash
+                    st.session_state.active_source = "upload"
+                    st.session_state.selected_sample = None
+                if st.session_state.get("active_source") in ("upload", None):
+                    st.session_state.active_source = "upload"
+                    nparr = np.frombuffer(file_bytes, np.uint8)
+                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if img is not None:
+                        input_image_to_process = img
 
     # Tab B: Webcam Capture
     with tab_camera:
-        camera_file = st.camera_input("Capture equation from webcam", key="camera_input")
-        if camera_file is not None:
-            file_bytes = camera_file.read()
-            nparr = np.frombuffer(file_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is not None:
-                input_image_to_process = img
-                st.session_state.selected_sample = None
-
-    # Tab C: Interactive Drawing Canvas (White paper with dark pen)
-    with tab_canvas:
-        st.markdown("<p style='font-size:0.85rem; color:var(--text-muted);'>Draw an equation using dark ink on white canvas:</p>", unsafe_allow_html=True)
-        canvas_col1, canvas_col2 = st.columns([4, 1])
-        with canvas_col2:
-            stroke_width = st.slider("Stroke Width", 3, 16, 6)
-            st.caption("Tip: Use smooth, separated strokes for best segmentation.")
-
-        with canvas_col1:
-            canvas_result = st_canvas(
-                fill_color="rgba(0, 0, 0, 0)",
-                stroke_width=stroke_width,
-                stroke_color="#0F172A",
-                background_color="#FFFFFF",
-                height=200,
-                width=720,
-                drawing_mode="freedraw",
-                return_image_data=True,
-                key="draw_canvas"
+        st.markdown(
+            "<p style='font-size:0.85rem; color:var(--text-muted); text-align:center; margin-bottom:10px;'>"
+            "Center your handwritten equation flat in front of the camera and hold steady:"
+            "</p>",
+            unsafe_allow_html=True
+        )
+        cam_col_left, cam_col_center, cam_col_right = st.columns([1, 3.0, 1])
+        with cam_col_center:
+            camera_file = st.camera_input(
+                "Capture equation from webcam",
+                key="camera_input",
+                help="Position your handwritten equation flat in front of the camera before capturing."
             )
-
-        if canvas_result.image_data is not None:
-            canvas_arr = canvas_result.image_data
-            # Check if non-empty (minimum pixel intensity is dark, indicating a drawn stroke)
-            if np.min(canvas_arr[..., :3]) < 220:
-                drawn_bgr = cv2.cvtColor(canvas_arr.astype(np.uint8), cv2.COLOR_RGBA2BGR)
-                if st.button("✨ Solve Canvas Drawing", type="primary"):
-                    input_image_to_process = drawn_bgr
-                    st.session_state.selected_sample = None
+            if camera_file is not None:
+                cam_bytes = camera_file.getvalue()
+                if cam_bytes:
+                    cam_hash = hashlib.md5(cam_bytes).hexdigest()
+                    if st.session_state.get("last_camera_hash") != cam_hash:
+                        st.session_state.last_camera_hash = cam_hash
+                        st.session_state.active_source = "camera"
+                        st.session_state.selected_sample = None
+                    if st.session_state.get("active_source") == "camera":
+                        nparr = np.frombuffer(cam_bytes, np.uint8)
+                        cam_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        if cam_img is not None:
+                            input_image_to_process = cam_img
 
     # Sample Gallery Buttons
     st.markdown("<p style='font-size:0.85rem; color:var(--text-secondary); margin-top:14px; font-weight:600;'>Or choose a pre-loaded sample equation:</p>", unsafe_allow_html=True)
@@ -243,11 +250,11 @@ with main_tab_solver:
             btn_label = f"Sample #{i+1}"
             with sample_cols[i]:
                 if st.button(btn_label, key=f"sample_btn_{i}", use_container_width=True):
+                    st.session_state.active_source = "sample"
                     st.session_state.selected_sample = sfile
-                    st.session_state.manual_overrides = {}
                     input_image_to_process = cv2.imread(sfile)
 
-    if st.session_state.selected_sample and input_image_to_process is None:
+    if st.session_state.get("active_source") == "sample" and st.session_state.selected_sample and input_image_to_process is None:
         input_image_to_process = cv2.imread(st.session_state.selected_sample)
 
     # -------------------------------------------------------------------------
@@ -265,22 +272,46 @@ with main_tab_solver:
         "debug": debug_save,
     }
 
+    # Detect if a completely new image was loaded
     if input_image_to_process is not None:
-        st.session_state.current_image = input_image_to_process
+        new_img_hash = hashlib.md5(input_image_to_process.tobytes()).hexdigest()
+        if new_img_hash != st.session_state.get("current_image_hash"):
+            st.session_state.current_image_hash = new_img_hash
+            st.session_state.current_image = input_image_to_process
+            st.session_state.manual_overrides = {}
+            st.session_state.last_applied_overrides = {}
+            st.session_state.pipeline_results = None
+            # Purge any stale override dropdown widget keys from session state
+            for k in list(st.session_state.keys()):
+                if k.startswith("override_select_"):
+                    del st.session_state[k]
+            if "equation_editor_input" in st.session_state:
+                del st.session_state["equation_editor_input"]
+
+    settings_changed = (settings != st.session_state.get("last_settings"))
+    overrides_changed = (st.session_state.manual_overrides != st.session_state.get("last_applied_overrides"))
 
     if st.session_state.current_image is not None and (
         st.session_state.pipeline_results is None
-        or input_image_to_process is not None
-        or st.session_state.manual_overrides
+        or settings_changed
+        or overrides_changed
     ):
         with st.spinner("Executing CV pipeline, neural inference, and symbolic solver..."):
+            print(f"[MathVision Live Run] Source: {st.session_state.get('active_source')}, Shape: {st.session_state.current_image.shape}, Dtype: {st.session_state.current_image.dtype}")
+            print(f"  Threshold: {settings['threshold_method']}, Architecture: {settings['model_type']}")
             results = run_pipeline(
                 st.session_state.current_image,
                 settings=settings,
                 manual_overrides=st.session_state.manual_overrides,
                 cached_models=models
             )
+            print(f"  Detected Boxes: {results['count']}, Symbols: {results['predicted_symbols']}")
+            print(f"  Confidences: {[round(c, 3) for c in results['confidences']]}")
+            print(f"  Parsed Expression: '{results['parsed'].get('parsed_expression')}' (Valid: {results['parsed'].get('is_valid')})")
+            print(f"  Solution Status: {results['solution'].get('status')}, Final Answer: {results['solution'].get('final_answer')}")
             st.session_state.pipeline_results = results
+            st.session_state.last_settings = settings.copy()
+            st.session_state.last_applied_overrides = st.session_state.manual_overrides.copy()
 
             # Log to session history if valid expression
             parsed_str = results["parsed"].get("parsed_expression", "")
@@ -322,7 +353,13 @@ with main_tab_solver:
 
         # Ambiguity Notice & Alerts
         ambig_list = res.get("parsed", {}).get("ambiguous_tokens", [])
-        if ambig_list:
+        if res.get("count", 0) == 1 and not parsed.get("is_valid", False):
+            render_alert_card(
+                "Single Symbol Detected (Incomplete)",
+                f"Only a single glyph ('{res['predicted_symbols'][0]}') was detected. If you submitted an equation, check contrast and margins.",
+                is_warning=True
+            )
+        elif ambig_list:
             ambig_notes = []
             for a in ambig_list:
                 idx_display = a["index"] + 1
@@ -332,6 +369,12 @@ with main_tab_solver:
             st.warning("⚠️ **Ambiguity Flagged:** " + " ".join(ambig_notes) + " You can edit the formula below or override symbols in the 'Symbols & Overrides' tab.")
         elif not parsed.get("is_valid", False):
             render_alert_card("Syntax Validation Alert", parsed.get("error_message", "Expression is incomplete or mathematically invalid."))
+        elif res.get("count", 0) == 1 and res.get("has_low_confidence", False):
+            render_alert_card(
+                "Single Symbol Detected (Low Confidence)",
+                f"Only 1 symbol ('{res['predicted_symbols'][0]}') was detected with confidence ({res['confidences'][0]*100:.1f}%) below your set threshold. If a full equation was intended, review input contrast.",
+                is_warning=True
+            )
         elif res.get("has_low_confidence", False):
             render_alert_card(
                 "Low Confidence Symbols Flagged",
@@ -422,23 +465,33 @@ with main_tab_solver:
         # ---------------------------------------------------------------------
         # Editable Recognition Preview Card
         # ---------------------------------------------------------------------
+        is_syntax_valid = parsed.get("is_valid", False)
+        if not is_syntax_valid:
+            status_badge = "<span class='tech-badge' style='background:#FEE2E2; color:#DC2626; border:1px solid #FCA5A5;'>✗ Invalid Syntax</span>"
+        elif ambig_list:
+            status_badge = "<span class='ambiguity-badge'>⚠️ Ambiguity Resolved</span>"
+        else:
+            status_badge = "<span class='tech-badge emerald'>✓ Valid Syntax</span>"
+
         st.markdown(
             f"""
             <div class="preview-card">
                 <div class="preview-header">
                     <span class="preview-title">Recognized Equation Preview</span>
-                    {"<span class='ambiguity-badge'>⚠️ Ambiguity Resolved</span>" if ambig_list else "<span class='tech-badge emerald'>✓ Valid Syntax</span>"}
+                    {status_badge}
                 </div>
             </div>
             """,
             unsafe_allow_html=True
         )
 
-        # Show LaTeX Formula Render
-        if parsed.get("latex_expression"):
+        # Show LaTeX Formula Render or raw code
+        if is_syntax_valid and parsed.get("latex_expression"):
             st.latex(parsed["latex_expression"])
         else:
-            st.code(parsed.get("parsed_expression", ""))
+            st.code(parsed.get("parsed_expression", ""), language="text")
+            if not is_syntax_valid and parsed.get("error_message"):
+                st.caption(f"⚠️ Validation Error: {parsed.get('error_message')}")
 
         # Interactive editable equation input
         col_edit1, col_edit2 = st.columns([4, 1])
@@ -456,18 +509,26 @@ with main_tab_solver:
 
         if re_solve_clicked and user_edited_expr.strip():
             with st.spinner("Re-solving customized formula..."):
-                custom_sol = solve_expression(user_edited_expr.strip())
-                res["solution"] = custom_sol
-                res["parsed"]["parsed_expression"] = user_edited_expr.strip()
-                # Update LaTeX
-                try:
-                    if "=" in user_edited_expr:
-                        lp, rp = user_edited_expr.split("=", 1)
-                        res["parsed"]["latex_expression"] = f"{sp.latex(sp.sympify(lp.strip()))} = {sp.latex(sp.sympify(rp.strip()))}"
-                    else:
-                        res["parsed"]["latex_expression"] = sp.latex(sp.sympify(user_edited_expr.strip()))
-                except Exception:
-                    res["parsed"]["latex_expression"] = user_edited_expr.strip()
+                cleaned_edit = user_edited_expr.strip()
+                is_val, edit_err = validate_expression(cleaned_edit)
+                res["parsed"]["parsed_expression"] = cleaned_edit
+                res["parsed"]["is_valid"] = is_val
+                res["parsed"]["error_message"] = edit_err
+                if is_val:
+                    custom_sol = solve_expression(cleaned_edit)
+                    res["solution"] = custom_sol
+                    res["parsed"]["latex_expression"] = to_latex(cleaned_edit)
+                else:
+                    res["solution"] = {
+                        "status": "error",
+                        "equation_type": "invalid_syntax",
+                        "error_message": edit_err,
+                        "steps": [],
+                        "final_answer": "Syntax Error",
+                        "final_answer_latex": "\\text{Syntax Error}",
+                        "roots": []
+                    }
+                    res["parsed"]["latex_expression"] = ""
                 st.session_state.pipeline_results = res
                 st.rerun()
 
@@ -635,11 +696,12 @@ with main_tab_solver:
                     current_display = LABEL_TO_DISPLAY.get(current_val, current_val)
                     curr_idx = display_options.index(current_display) if current_display in display_options else 0
 
+                    img_prefix = st.session_state.get("current_image_hash", "default")[:8]
                     new_choice = st.selectbox(
                         f"Label #{i+1}",
                         options=display_options,
                         index=curr_idx,
-                        key=f"override_select_{i}",
+                        key=f"override_select_{img_prefix}_{i}",
                         label_visibility="collapsed"
                     )
 
@@ -727,7 +789,7 @@ with main_tab_solver:
                             st.image(fc_path, caption=f"True: {true_display} → Pred: {pred_display}", use_container_width=True)
 
     else:
-        st.info("👈 Upload an equation image, draw on the canvas, or select a sample equation above to begin!")
+        st.info("👈 Upload an equation image or select a sample equation above to begin!")
 
 
 # =============================================================================
@@ -771,71 +833,6 @@ with main_tab_history:
                     st.session_state.current_image = h["image"]
                     st.session_state.pipeline_results = h["results"]
                     st.rerun()
-
-
-# =============================================================================
-# TAB 3: ABOUT & VIVA DEFENSE GUIDE
-# =============================================================================
-with main_tab_viva:
-    st.markdown("### 🎓 About MathVision & Viva Defense Guide")
-    st.markdown("<p style='color:var(--text-secondary); font-size:0.9rem;'>Essential theoretical insights, architectural justification, and zero-leakage evaluation methodology for university project evaluation and viva defense.</p>", unsafe_allow_html=True)
-
-    with st.expander("1. End-to-End System Architecture & Data Flow", expanded=True):
-        st.markdown(
-            """
-            MathVision employs a modular, inspectable 7-stage pipeline:
-            1. **Image Preprocessing:** Ingestion, resize with aspect-ratio preservation, grayscale conversion, and Adaptive Gaussian thresholding.
-            2. **Morphological Filtering:** Morphological opening ($3\\times 3$ kernel) removes salt-and-pepper noise; morphological closing bridges minor stroke gaps.
-            3. **Contour Segmentation & Merging:** External contour detection isolates characters. A multi-stroke merging heuristic pairs disjoint strokes belonging to `$=$` and `$\\div$`.
-            4. **Aspect-Preserving Normalization:** Each glyph is centered on a $45\\times 45$ canvas with zero padding to prevent non-square distortion.
-            5. **Deep CNN Inference:** 3-block convolutional neural network (895k parameters) computes softmax posterior probabilities over 18 mathematical classes.
-            6. **Bayesian Grammar Soft Rescoring:** Resolves ambiguous `$x$` vs `$\\times$` glyphs by combining CNN logits with neighboring grammar transition priors. Low-margin cases are flagged with amber warnings.
-            7. **Step-by-Step Symbolic Solver:** SymPy parses the verified mathematical AST and generates step-by-step pedagogical derivations for arithmetic, linear, and quadratic problems.
-            """
-        )
-
-    with st.expander("2. Computer Vision Defense (OpenCV)", expanded=False):
-        st.markdown(
-            """
-            - **Why Adaptive Thresholding over Global/Otsu?** Global fixed cutoff (127) fails when paper has shadows or gradients. Otsu computes a single global threshold which breaks when background lighting is non-uniform across the page. Adaptive Gaussian calculates local thresholds per $15\\times 15$ window, providing robust binarization across uneven ambient light.
-            - **Why Aspect-Preserving Padding to 45×45?** Directly resizing non-square contours (e.g. a narrow `1` or wide `-`) to $45\\times 45$ artificially stretches strokes, destroying topological features. Centering the scaled character with black border padding preserves original geometric proportions.
-            - **How are Multi-stroke Symbols Merged?** Equals (`=`) consists of two separate horizontal strokes, and division (`÷`) consists of a bar and two dots. The pipeline calculates the horizontal bounding box overlap ratio $\\frac{\\text{overlap}}{\\min(w_1, w_2)}$. When overlap $> 0.35$ and vertical gap is within threshold, the components are unioned into a single glyph bounding box.
-            """
-        )
-
-    with st.expander("3. Deep Learning & Disambiguation Defense", expanded=False):
-        st.markdown(
-            """
-            - **Why CNN over HOG + SVM?** HOG features rely on hand-crafted gradient orientation histograms, achieving 93.05% test accuracy. The 3-block CNN learns hierarchical spatial representations (edges $\\to$ junctions $\\to$ whole glyph parts), achieving 94.18% accuracy with higher resilience to stroke thickness variations.
-            - **Why Soft Rescoring over Hard Rules?** Hard grammatical rules crash or yield invalid syntax when users write non-standard expressions. Soft rescoring applies Bayesian posterior updates:
-              $$\\log P(\\text{symbol} \\mid \\text{context}) = \\log P_{\\text{CNN}}(\\text{symbol}) + w_{\\text{gram}} \\cdot \\log P(\\text{symbol} \\mid \\text{neighbors})$$
-              When posterior margin $|\\Delta \\log P| < 0.60$, the system flags the equation as *amber* for human confirmation rather than making a high-confidence error.
-            """
-        )
-
-    with st.expander("4. Zero-Leakage Data Integrity & Honest Evaluation", expanded=False):
-        st.markdown(
-            """
-            - **Strict Split Protocol:** 18,994 samples split 70% Train (13,296), 15% Validation (2,849), and 15% Held-Out Test (2,849) using fixed seed 42.
-            - **Grammar Priors & Hyperparameters:** Tuned exclusively on validation split crops and equations. Held-out test crops were never accessed during training or prior estimation.
-            - **Equation-Level Performance on 220 Held-Out Equations:**
-              - Raw CNN exact accuracy: 60.45% (133/220) with 54 $x \\leftrightarrow \\times$ confusions.
-              - Production Rescoring exact accuracy: **77.27% (170/220)** with only 5 cross errors (-90.7% error reduction).
-              - Strict autonomous accuracy (flagged counted as error): **68.18% (150/220)**.
-              - Oracle-simulated assisted accuracy: **78.64% (173/220)**.
-            - **Known Academic Limitation:** The Kaggle dataset lacks writer identifiers. Test accuracy reflects unseen images from seen writer styles; genuine novel unseen-writer performance is expected to be 5–10% lower.
-            """
-        )
-
-    with st.expander("5. Comprehensive Project Documentation References", expanded=False):
-        st.markdown(
-            """
-            Detailed documentation artifacts are preserved in the codebase for reference:
-            - **Model Card:** [`docs/MODEL_CARD.md`](file:///C:/Users/Jainam/Downloads/CV%20Project/docs/MODEL_CARD.md)
-            - **Viva Defense Preparation Guide:** [`docs/VIVA_PREPARATION_GUIDE.md`](file:///C:/Users/Jainam/Downloads/CV%20Project/docs/VIVA_PREPARATION_GUIDE.md)
-            - **Evaluation & Benchmark Output:** [`outputs/results.md`](file:///C:/Users/Jainam/Downloads/CV%20Project/outputs/results.md)
-            """
-        )
 
 
 # =============================================================================

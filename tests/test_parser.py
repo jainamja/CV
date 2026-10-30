@@ -290,3 +290,141 @@ def test_detect_exponents_does_not_trigger_on_normal_baseline():
     assert augmented == ["2", "x"], f"Expected ['2', 'x'], got {augmented}"
 
 
+def test_detect_exponents_does_not_trigger_on_multi_digit_numbers():
+    """
+    REGRESSION TEST:
+    Multi-digit numbers with slight natural vertical wobble (e.g. '12' or '48')
+    must not have '**' inserted between digits.
+    """
+    symbols_12 = ["1", "2"]
+    boxes_12 = [(47, 85, 6, 32), (64, 74, 32, 34)]
+    assert detect_exponents(symbols_12, boxes_12) == ["1", "2"]
+
+    symbols_48 = ["4", "8"]
+    boxes_48 = [(109, 71, 28, 28), (156, 64, 27, 34)]
+    assert detect_exponents(symbols_48, boxes_48) == ["4", "8"]
+
+
+def test_parse_real_case_12_plus_8_div_4():
+    """
+    REGRESSION TEST:
+    End-to-end parse of real test case '12 + 8 ÷ 4'.
+    Must correctly parse to '12+8/4' without spurious exponent or variable.
+    """
+    symbols = ["1", "2", "+", "8", "div", "4"]
+    boxes = [
+        (47, 85, 6, 32),
+        (64, 74, 32, 34),
+        (108, 71, 29, 29),
+        (155, 64, 28, 35),
+        (210, 63, 49, 33),
+        (276, 55, 30, 33)
+    ]
+    res = parse_symbols(symbols, boxes)
+    assert res["is_valid"] is True
+    assert res["parsed_expression"] == "12+8/4"
+    assert "\\div" in res["latex_expression"]
+
+
+def test_detect_exponents_does_not_convert_three_digits_111_to_exponent():
+    """
+    REGRESSION TEST (Bug: Normal Handwriting Incorrectly Detected as Exponent 111):
+    Consecutive digits like '111' following a variable 'x' or a leading digit '1'
+    must NEVER be converted to 'x**111' or '1**111'.
+    In single-line handwritten math, 3-digit sequences are multi-digit integers/operands.
+    """
+    # Case A: Variable 'x' followed by three ones '111'
+    symbols_x111 = ["x", "1", "1", "1"]
+    boxes_x111 = [(10, 20, 30, 40), (45, 15, 15, 25), (65, 15, 15, 25), (85, 15, 15, 25)]
+    augmented_x111 = detect_exponents(symbols_x111, boxes_x111)
+    assert "**" not in augmented_x111, f"Expected no '**' in {augmented_x111}"
+    res_x111 = parse_symbols(symbols_x111, boxes_x111)
+    assert res_x111["is_valid"] is True
+    assert res_x111["parsed_expression"] == "x*111"
+    assert "exceeds safe limit" not in res_x111["error_message"]
+
+    # Case B: Four ones '1111'
+    symbols_1111 = ["1", "1", "1", "1"]
+    boxes_1111 = [(10, 20, 15, 40), (30, 15, 15, 25), (50, 15, 15, 25), (70, 15, 15, 25)]
+    augmented_1111 = detect_exponents(symbols_1111, boxes_1111)
+    assert "**" not in augmented_1111, f"Expected no '**' in {augmented_1111}"
+    res_1111 = parse_symbols(symbols_1111, boxes_1111)
+    assert res_1111["is_valid"] is True
+    assert res_1111["parsed_expression"] == "1111"
+    assert "exceeds safe limit" not in res_1111["error_message"]
+
+
+def test_detect_exponents_isolates_exponent_boundary_with_baseline_digits():
+    """
+    REGRESSION TEST:
+    When an elevated single-digit exponent (e.g. x^2) is followed by baseline digits (e.g. 11),
+    the baseline digits must NOT be swallowed into the exponent power operand (preventing 'x**211').
+    """
+    symbols = ["x", "2", "1", "1"]
+    # 'x': (10, 20, 30, 40), '2': elevated (45, 15, 15, 25), '1', '1': baseline (65, 20, 15, 40), (85, 20, 15, 40)
+    boxes = [(10, 20, 30, 40), (45, 15, 15, 25), (65, 20, 15, 40), (85, 20, 15, 40)]
+    augmented = detect_exponents(symbols, boxes)
+    assert augmented == ["x", "**", "2", "*", "1", "1"]
+    res = parse_symbols(symbols, boxes)
+    assert res["is_valid"] is True
+    assert res["parsed_expression"] == "x**2*11"
+
+
+def test_extreme_true_exponent_remains_safely_rejected():
+    """
+    SECURITY TEST:
+    Direct syntactically intentional excessive exponents (e.g. '**111' or '**999')
+    must remain strictly rejected by validate_expression and solver limits.
+    """
+    valid, msg = validate_expression("x**111")
+    assert valid is False
+    assert "exceeds safe limit" in msg
+    assert "111" in msg
+
+
+def test_repair_syntax_artifacts_decomposed_division_and_split_four():
+    """Regression test: Decomposed division ('--', '(') and fractured '4' ('(1') reconstructs 12+8/4."""
+    from src.solver import solve_expression
+    raw_symbols = ["1", "2", "+", "8", "-", "-", "(", "1"]
+    boxes = [
+        (47, 85, 5, 31),
+        (64, 74, 31, 34),
+        (109, 71, 28, 28),
+        (155, 64, 28, 34),
+        (210, 69, 49, 11),
+        (231, 63, 9, 8),
+        (233, 87, 8, 9),
+        (276, 56, 30, 32)
+    ]
+    parsed = parse_symbols(raw_symbols, boxes=boxes)
+    assert parsed["is_valid"] is True
+    assert parsed["parsed_expression"] == "12+8/4"
+    assert "div" in parsed["raw_expression"] or "/" in parsed["raw_expression"]
+    assert "4" in parsed["parsed_expression"]
+    
+    # Solve to verify final arithmetic result equals 14
+    sol = solve_expression(parsed["parsed_expression"])
+    assert sol["status"] == "solved"
+    assert sol["final_answer"] == "14"
+
+
+def test_repair_syntax_artifacts_div_with_split_four():
+    """Regression test: 'div' followed by fractured '4' ('(', '1') reconstructs 12+8/4."""
+    raw_symbols = ["1", "2", "+", "8", "div", "(", "1"]
+    boxes = [
+        (47, 85, 5, 31),
+        (64, 74, 31, 34),
+        (109, 71, 28, 28),
+        (155, 64, 28, 34),
+        (210, 63, 49, 33),
+        (276, 56, 15, 32),
+        (292, 56, 14, 32)
+    ]
+    parsed = parse_symbols(raw_symbols, boxes=boxes)
+    assert parsed["is_valid"] is True
+    assert parsed["parsed_expression"] == "12+8/4"
+
+
+
+
+

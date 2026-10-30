@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.tmp*
 
 # Pytest & Coverage
 .pytest_cache/
@@ -13,11 +14,22 @@ htmlcov/
 venv/
 ENV/
 
-# Large extracted raw directory (safely preserved in external backup)
+# Large raw dataset directory (external backup)
 data/raw/
 
-# Temporary / Scratch logs
-*.log
+# Experimental / Remediated datasets (avoid repo bloat)
+data/processed/split_data_v*.npz
 
-# Scratch scripts
+# Experimental non-production model checkpoints
+models/cnn_experimental_v*.keras
+*.pre_phase5_backup
+
+# Generated result archives & test bundles
+outputs/*.zip
+outputs/experimental_*_predictions.npz
+
+# Temporary / Scratch logs & scripts
+*.log
 scratch/
+*.bak
+*.bak_*

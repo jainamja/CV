@@ -378,7 +378,8 @@ CV Project/
 
 ### 1. Clone & Install Dependencies
 ```bash
-cd "c:\Users\Jainam\Downloads\CV Project"
+git clone https://github.com/jainamja/CV.git
+cd CV
 pip install -r requirements.txt
 ```
 
