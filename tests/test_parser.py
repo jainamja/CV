@@ -428,3 +428,99 @@ def test_repair_syntax_artifacts_div_with_split_four():
 
 
 
+
+
+def test_format_ambiguity_notes_handles_missing_index():
+    """
+    REGRESSION TEST:
+    Verifies that format_ambiguity_notes() cleanly handles structural / expression-level
+    ambiguity dictionaries that do not have an 'index' key (such as
+    suspicious_implicit_multiplication), resolving the Streamlit Cloud KeyError.
+    """
+    from src.parser import format_ambiguity_notes
+
+    structural_ambig = [
+        {
+            "type": "suspicious_implicit_multiplication",
+            "reason": "Implicit multiplication applied between ')' and multi-digit number (14). May indicate an omitted or misclassified operator.",
+            "flag_for_review": True
+        }
+    ]
+
+    # Must NOT raise KeyError: 'index'
+    notes = format_ambiguity_notes(structural_ambig)
+    assert len(notes) == 1
+    assert "Implicit multiplication" in notes[0]
+    assert "(14)" in notes[0]
+
+
+def test_format_ambiguity_notes_token_level_and_mixed():
+    """
+    REGRESSION TEST:
+    Verifies formatting for token-level classification ambiguities, structural warnings,
+    and mixed lists without default index fabrication or silent data suppression.
+    """
+    from src.parser import format_ambiguity_notes
+
+    # 1. Token-level ambiguity with chosen and alternative
+    token_ambig = [
+        {
+            "index": 2,
+            "chosen": "times",
+            "alternative": "x",
+            "margin": 0.12,
+            "reason": "Narrow posterior margin between variable 'x' and multiplication '×'"
+        }
+    ]
+    notes_token = format_ambiguity_notes(token_ambig)
+    assert len(notes_token) == 1
+    assert notes_token[0] == "Symbol #3 resolved to **×** (alternative: **x**)."
+
+    # 2. Mixed list: token-level + structural
+    mixed = [
+        {
+            "index": 0,
+            "chosen": "div",
+            "alternative": "+",
+            "reason": "Disambiguated '+' -> 'div'"
+        },
+        {
+            "type": "suspicious_implicit_multiplication",
+            "reason": "Implicit multiplication applied between ')' and multi-digit number (24).",
+            "flag_for_review": True
+        }
+    ]
+    notes_mixed = format_ambiguity_notes(mixed)
+    assert len(notes_mixed) == 2
+    assert "Symbol #1 resolved to **÷** (alternative: **+**)." == notes_mixed[0]
+    assert "Implicit multiplication applied" in notes_mixed[1]
+
+    # 3. ambig_dict comprehension safety (reproducing app.py line 655)
+    ambig_dict = {a["index"]: a for a in mixed if "index" in a and a["index"] is not None}
+    assert 0 in ambig_dict
+    assert len(ambig_dict) == 1
+    assert ambig_dict[0]["chosen"] == "div"
+
+
+def test_end_to_end_implicit_multiplication_ambiguity_ui_contract():
+    """
+    REGRESSION TEST:
+    Verifies the end-to-end data contract from parse_symbols() -> format_ambiguity_notes()
+    for an equation containing ')' followed by multi-digit operands.
+    """
+    from src.parser import parse_symbols, format_ambiguity_notes
+
+    syms = ["(", "18", "+", "6", ")", "1", "4"]
+    p = parse_symbols(syms)
+
+    ambig = p.get("ambiguous_tokens", [])
+    assert len(ambig) > 0
+
+    # Ensure format_ambiguity_notes processes it safely
+    notes = format_ambiguity_notes(ambig)
+    assert len(notes) > 0
+    assert any("implicit multiplication" in n.lower() for n in notes)
+
+    # Ensure ambig_dict comprehension from app.py line 655 evaluates safely
+    ambig_dict = {a["index"]: a for a in ambig if "index" in a and a["index"] is not None}
+    assert isinstance(ambig_dict, dict)

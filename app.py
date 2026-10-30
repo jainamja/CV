@@ -20,7 +20,7 @@ import streamlit as st
 from PIL import Image
 
 from src.pipeline import run_pipeline, get_loaded_models, create_results_zip
-from src.parser import validate_expression, to_latex
+from src.parser import validate_expression, to_latex, format_ambiguity_notes
 from src.solver import solve_expression, safe_latex, safe_str
 from src.dataset import CLASSES, LABEL_TO_DISPLAY
 from ui.components import (
@@ -360,13 +360,9 @@ with main_tab_solver:
                 is_warning=True
             )
         elif ambig_list:
-            ambig_notes = []
-            for a in ambig_list:
-                idx_display = a["index"] + 1
-                ch = LABEL_TO_DISPLAY.get(a["chosen"], a["chosen"])
-                alt = LABEL_TO_DISPLAY.get(a["alternative"], a["alternative"])
-                ambig_notes.append(f"Symbol #{idx_display} resolved to **{ch}** (alternative: **{alt}**).")
-            st.warning("⚠️ **Ambiguity Flagged:** " + " ".join(ambig_notes) + " You can edit the formula below or override symbols in the 'Symbols & Overrides' tab.")
+            ambig_notes = format_ambiguity_notes(ambig_list, LABEL_TO_DISPLAY)
+            if ambig_notes:
+                st.warning("⚠️ **Ambiguity Flagged:** " + " ".join(ambig_notes) + " You can edit the formula below or override symbols in the 'Symbols & Overrides' tab.")
         elif not parsed.get("is_valid", False):
             render_alert_card("Syntax Validation Alert", parsed.get("error_message", "Expression is incomplete or mathematically invalid."))
         elif res.get("count", 0) == 1 and res.get("has_low_confidence", False):
@@ -652,7 +648,7 @@ with main_tab_solver:
             confs = res["confidences"]
             low_flags = res["is_low_confidence"]
             ambig_list = res.get("parsed", {}).get("ambiguous_tokens", [])
-            ambig_dict = {a["index"]: a for a in ambig_list}
+            ambig_dict = {a["index"]: a for a in ambig_list if "index" in a and a["index"] is not None}
 
             num_cols = min(8, max(4, len(crops)))
             sym_cols = st.columns(num_cols)
@@ -707,7 +703,7 @@ with main_tab_solver:
 
                     if is_ambig:
                         info = ambig_dict[i]
-                        st.caption(f"⚠️ {info['reason']}")
+                        st.caption(f"⚠️ {info.get('reason', 'Ambiguity flagged')}")
 
                     # Check for override change
                     canonical_choice = CLASSES[display_options.index(new_choice)]

@@ -826,3 +826,39 @@ def parse_symbols(
         "disambiguated_symbols": symbols_disambiguated,
         "ambiguous_tokens": ambiguous_tokens
     }
+
+
+def format_ambiguity_notes(
+    ambig_list: List[Dict[str, Any]],
+    label_to_display: Optional[Dict[str, str]] = None
+) -> List[str]:
+    """
+    Formats ambiguity items (both token-level and expression-level/structural)
+    into human-readable explanatory notes for display.
+
+    Handles:
+      1. Token-level classification ambiguity with 'index', 'chosen', and optional 'alternative'.
+      2. Token-level classification ambiguity with 'index' and 'reason'.
+      3. Structural / expression-level ambiguity with 'reason' or 'type' (no single token index).
+    """
+    mapping = label_to_display or {"times": "×", "div": "÷"}
+    notes = []
+    for a in ambig_list:
+        if "index" in a and a["index"] is not None and "chosen" in a:
+            idx_display = a["index"] + 1
+            ch = mapping.get(a["chosen"], a["chosen"])
+            alt = mapping.get(a.get("alternative", ""), a.get("alternative", ""))
+            if alt:
+                notes.append(f"Symbol #{idx_display} resolved to **{ch}** (alternative: **{alt}**).")
+            else:
+                notes.append(f"Symbol #{idx_display} resolved to **{ch}**.")
+        elif "index" in a and a["index"] is not None:
+            idx_display = a["index"] + 1
+            reason_msg = a.get("reason", "Ambiguous classification")
+            notes.append(f"Symbol #{idx_display}: {reason_msg}.")
+        elif "reason" in a and a["reason"]:
+            notes.append(str(a["reason"]))
+        elif "type" in a:
+            notes.append(f"Flagged {a['type'].replace('_', ' ')}.")
+    return notes
+
