@@ -894,6 +894,7 @@ def solve_expression(expr_str: str) -> Dict[str, Any]:
                 status_text = "Contradiction: No solution"
                 latex_ans = "\\emptyset \\quad (\\text{No solution})"
 
+            rel_op = "=" if is_identity else "\\neq"
             return {
                 "status": status_key,
                 "equation_type": "arithmetic_equality",
@@ -914,7 +915,7 @@ def solve_expression(expr_str: str) -> Dict[str, Any]:
                         "step_number": 3,
                         "title": "Verify Equality",
                         "description": "Compare LHS and RHS values.",
-                        "latex": f"{safe_latex(lhs_sym)} {'=' if is_identity else '\\neq'} {safe_latex(rhs_sym)} \\implies \\text{{{status_text}}}"
+                        "latex": f"{safe_latex(lhs_sym)} {rel_op} {safe_latex(rhs_sym)} \\implies \\text{{{status_text}}}"
                     }
                 ],
                 "final_answer": status_text,

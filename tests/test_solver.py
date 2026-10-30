@@ -206,3 +206,58 @@ def test_safe_latex_and_safe_str_never_raise_value_error():
     assert safe_latex(huge_rat) == TOO_LARGE_MSG_LATEX
 
 
+def test_solve_arithmetic_equality_pathways():
+    """
+    REGRESSION TEST:
+    Verifies arithmetic equality formatting (identity and contradiction) in step 3
+    does not fail with Python 3.11 SyntaxError (f-string expression with backslash).
+    """
+    # 1. Identity case (2 + 3 = 5)
+    res_id = solve_expression("2 + 3 = 5")
+    assert res_id["status"] == "solved"
+    assert res_id["equation_type"] == "arithmetic_equality"
+    assert "=" in res_id["steps"][2]["latex"]
+    assert "Identity" in res_id["final_answer"]
+
+    # 2. Contradiction case (2 + 3 = 10)
+    res_contra = solve_expression("2 + 3 = 10")
+    assert res_contra["status"] == "unsolvable"
+    assert res_contra["equation_type"] == "arithmetic_equality"
+    assert "\\neq" in res_contra["steps"][2]["latex"]
+    assert "Contradiction" in res_contra["final_answer"]
+
+
+def test_no_backslashes_in_fstring_expressions():
+    """
+    REGRESSION TEST:
+    Python <3.12 (e.g. Render's Python 3.11.9) raises SyntaxError when backslashes
+    are used inside f-string replacement expressions {...}.
+    Scans all repository Python files to verify compliance.
+    """
+    import ast
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    violations = []
+
+    for py_file in repo_root.rglob("*.py"):
+        # Ignore virtual environments, git, and cache
+        parts = py_file.parts
+        if any(p in parts for p in (".git", "venv", ".venv", "env", "__pycache__")):
+            continue
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        except Exception:
+            continue
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FormattedValue):
+                # Check formatted value expression segment for backslash
+                expr_segment = ast.get_source_segment(py_file.read_text(encoding="utf-8"), node.value)
+                if expr_segment and "\\" in expr_segment:
+                    violations.append(f"{py_file}:{node.lineno}: {expr_segment}")
+
+    assert not violations, f"Illegal backslashes found in f-string expressions: {violations}"
+
+
+
